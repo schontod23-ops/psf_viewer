@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PSF Array Viewer</title>
+  </head>
+  <body>
+    <!-- ambient wave-interference field (very low opacity) -->
+    <canvas id="field" aria-hidden="true"></canvas>
+
+    <div class="app">
+      <!-- ───────────────────────── header ───────────────────────── -->
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div class="brand-text">
+            <h1>Point&nbsp;Spread&nbsp;Function</h1>
+            <p>microphone&nbsp;array&nbsp;·&nbsp;delay-and-sum&nbsp;beamformer</p>
+          </div>
+        </div>
+        <div class="seam" aria-hidden="true"></div>
+        <div class="status" id="status">
+          <div class="stat"><span class="k">f</span><span class="v" id="st-f">—</span></div>
+          <div class="stat"><span class="k">λ</span><span class="v" id="st-lambda">—</span></div>
+          <div class="stat"><span class="k">f<sub>alias</sub></span><span class="v" id="st-alias">—</span></div>
+        </div>
+      </header>
+
+      <!-- ───────────────────────── controls ───────────────────────── -->
+      <aside class="rail" id="rail">
+        <section class="group">
+          <div class="eyebrow">Array</div>
+
+          <div class="seg" data-seg="source">
+            <button data-val="sunflower" class="on">Sunflower</button>
+            <button data-val="csv">CSV file</button>
+          </div>
+
+          <div data-when="source=sunflower">
+            <label class="field">
+              <span>Microphones <em id="lab-n">64</em></span>
+              <input type="range" id="n" min="4" max="256" step="1" value="64" />
+            </label>
+            <label class="field">
+              <span>Diameter <em id="lab-d">0.50 m</em></span>
+              <input type="range" id="diameter" min="0.05" max="3" step="0.01" value="0.5" />
+            </label>
+            <div class="field">
+              <span>Array plane</span>
+              <div class="seg sm" data-seg="aplane">
+                <button data-val="xy" class="on">xy</button>
+                <button data-val="xz">xz</button>
+                <button data-val="yz">yz</button>
+              </div>
+            </div>
+            <div class="field">
+              <span>Array centre (m)</span>
+              <div class="triple">
+                <input type="number" id="acx" value="0" step="0.05" aria-label="array center x" />
+                <input type="number" id="acy" value="0" step="0.05" aria-label="array center y" />
+                <input type="number" id="acz" value="0" step="0.05" aria-label="array center z" />
+              </div>
+            </div>
+          </div>
+
+          <div data-when="source=csv" hidden>
+            <button class="file-btn" id="csv-btn">Load positions…</button>
+            <input type="file" id="csv-input" accept=".csv,.txt,.tsv" hidden />
+            <p class="hint" id="csv-status">3 columns x,y,z (metres). Optional 4th = weight.</p>
+          </div>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">Focus plane</div>
+          <div class="field">
+            <span>Plane</span>
+            <div class="seg sm" data-seg="fplane">
+              <button data-val="xy" class="on">xy</button>
+              <button data-val="xz">xz</button>
+              <button data-val="yz">yz</button>
+            </div>
+          </div>
+          <div class="field">
+            <span>Centre (m)</span>
+            <div class="triple">
+              <input type="number" id="fcx" value="0" step="0.05" aria-label="focus center x" />
+              <input type="number" id="fcy" value="0" step="0.05" aria-label="focus center y" />
+              <input type="number" id="fcz" value="1" step="0.05" aria-label="focus center z" />
+            </div>
+          </div>
+          <div class="field grid2">
+            <label><span>Width (m)</span><input type="number" id="width" value="1" min="0.05" step="0.05" /></label>
+            <label><span>Height (m)</span><input type="number" id="height" value="1" min="0.05" step="0.05" /></label>
+          </div>
+          <label class="field">
+            <span>Grid step dx <em id="lab-dx">0.020 m</em></span>
+            <input type="range" id="dx" min="0.005" max="0.1" step="0.005" value="0.02" />
+          </label>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">Physics</div>
+          <label class="field">
+            <span>Frequency <em id="lab-f">5000 Hz</em></span>
+            <input type="range" id="frequency" min="100" max="20000" step="50" value="5000" />
+          </label>
+          <label class="field grid2">
+            <span class="full">Speed of sound (m/s)</span>
+            <input type="number" id="c" value="343" min="1" step="1" />
+            <div class="seg sm" data-seg="shading">
+              <button data-val="uniform" class="on">Uniform</button>
+              <button data-val="hann">Hann</button>
+            </div>
+          </label>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">Display</div>
+          <label class="field">
+            <span>Dynamic range <em id="lab-dyn">30 dB</em></span>
+            <input type="range" id="dyn" min="6" max="60" step="1" value="30" />
+          </label>
+          <label class="field">
+            <span>Contour bands <em id="lab-levels">10</em></span>
+            <input type="range" id="levels" min="4" max="24" step="1" value="10" />
+          </label>
+          <label class="check">
+            <input type="checkbox" id="lines" checked />
+            <span>Contour lines</span>
+          </label>
+        </section>
+      </aside>
+
+      <!-- ───────────────────────── stages ───────────────────────── -->
+      <main class="stage stage-3d">
+        <div class="panel-label">Geometry<span class="dim"> · drag to rotate</span></div>
+        <div id="three" class="canvas-host"></div>
+      </main>
+
+      <main class="stage stage-psf">
+        <div class="panel-label">Point spread function<span class="dim" id="psf-plane"> · xy</span></div>
+        <div id="plot" class="canvas-host"></div>
+      </main>
+
+      <!-- ───────────────────────── metrics ───────────────────────── -->
+      <footer class="metrics" id="metrics">
+        <div class="metric"><span class="k">Microphones</span><span class="v" id="m-n">—</span></div>
+        <div class="metric"><span class="k">Aperture</span><span class="v" id="m-ap">—</span></div>
+        <div class="metric"><span class="k">−3 dB beam (u × v)</span><span class="v" id="m-bw">—</span></div>
+        <div class="metric"><span class="k">Peak sidelobe</span><span class="v" id="m-psl">—</span></div>
+        <div class="metric"><span class="k">Alias frequency</span><span class="v" id="m-alias">—</span></div>
+        <div class="metric grow"><span class="k">State</span><span class="v" id="m-state">—</span></div>
+      </footer>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

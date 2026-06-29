@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PSF Array Viewer",
+  "version": "0.1.0",
+  "identifier": "com.psfviewer.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "PSF Array Viewer",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 660,
+        "resizable": true,
+        "transparent": false,
+        "decorations": true,
+        "theme": "Dark"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "deb", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "Acoustic PSF viewer for microphone arrays",
+    "longDescription": "Visualise the acoustic point-spread function of a microphone array with a near-field delay-and-sum beamformer, a rotatable 3-D geometry view and a filled-contour PSF map."
+  }
+}

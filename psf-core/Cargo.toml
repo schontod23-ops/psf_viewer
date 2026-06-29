@@ -1,0 +1,16 @@
+[package]
+name = "psf-core"
+version = "0.1.0"
+edition = "2021"
+description = "Acoustic point-spread-function engine for microphone arrays"
+license = "MIT"
+
+[lib]
+name = "psf_core"
+path = "src/lib.rs"
+
+[dependencies]
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
