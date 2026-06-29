@@ -40,11 +40,17 @@
           <div data-when="source=sunflower">
             <label class="field">
               <span>Microphones <em id="lab-n">64</em></span>
-              <input type="range" id="n" min="4" max="256" step="1" value="64" />
+              <div class="slider-num-row">
+                <input type="range" id="n" min="4" max="256" step="1" value="64" />
+                <input type="number" id="n-num" class="slider-num" min="4" max="256" step="1" value="64" aria-label="microphone count" />
+              </div>
             </label>
             <label class="field">
               <span>Diameter <em id="lab-d">0.50 m</em></span>
-              <input type="range" id="diameter" min="0.05" max="3" step="0.01" value="0.5" />
+              <div class="slider-num-row">
+                <input type="range" id="diameter" min="0.05" max="3" step="0.01" value="0.5" />
+                <input type="number" id="diameter-num" class="slider-num" min="0.05" max="3" step="0.01" value="0.5" aria-label="diameter (m)" />
+              </div>
             </label>
             <div class="field">
               <span>Array plane</span>
@@ -95,7 +101,38 @@
           </div>
           <label class="field">
             <span>Grid step dx <em id="lab-dx">0.020 m</em></span>
-            <input type="range" id="dx" min="0.005" max="0.1" step="0.005" value="0.02" />
+            <div class="slider-num-row">
+              <input type="range" id="dx" min="0.005" max="0.1" step="0.005" value="0.02" />
+              <input type="number" id="dx-num" class="slider-num" min="0.005" max="0.1" step="0.005" value="0.02" aria-label="grid step dx (m)" />
+            </div>
+          </label>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">Source</div>
+          <label class="check" style="margin-bottom:10px">
+            <input type="checkbox" id="src-at-focus" />
+            <span>Source at focus centre</span>
+          </label>
+          <div class="field" id="src-pos-fields">
+            <span>Source position (m)</span>
+            <div class="triple">
+              <input type="number" id="srx" value="0" step="0.05" aria-label="source x" />
+              <input type="number" id="sry" value="0" step="0.05" aria-label="source y" />
+              <input type="number" id="srz" value="1" step="0.05" aria-label="source z" />
+            </div>
+          </div>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">3-D View</div>
+          <label class="check" style="margin-bottom:10px">
+            <input type="checkbox" id="multiplane" />
+            <span>Show all focus planes (xy / xz / yz)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="raytrace" />
+            <span>Path tracing<span class="hint" style="display:inline;margin:0 0 0 6px;font-size:9.5px">(progressive)</span></span>
           </label>
         </section>
 
@@ -103,7 +140,10 @@
           <div class="eyebrow">Physics</div>
           <label class="field">
             <span>Frequency <em id="lab-f">5000 Hz</em></span>
-            <input type="range" id="frequency" min="100" max="20000" step="50" value="5000" />
+            <div class="slider-num-row">
+              <input type="range" id="frequency" min="100" max="20000" step="50" value="5000" />
+              <input type="number" id="frequency-num" class="slider-num" min="100" max="20000" step="50" value="5000" aria-label="frequency (Hz)" />
+            </div>
           </label>
           <label class="field grid2">
             <span class="full">Speed of sound (m/s)</span>
@@ -134,7 +174,7 @@
 
       <!-- ───────────────────────── stages ───────────────────────── -->
       <main class="stage stage-3d">
-        <div class="panel-label">Geometry<span class="dim"> · drag to rotate</span></div>
+        <div class="panel-label">Geometry<span class="dim"> · drag to rotate</span><span class="rt-badge" id="rt-badge" hidden> · path tracing</span></div>
         <div id="three" class="canvas-host"></div>
       </main>
 
