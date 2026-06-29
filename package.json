@@ -13,7 +13,8 @@
     "@tauri-apps/api": "^2",
     "d3-contour": "^4",
     "d3-scale-chromatic": "^3",
-    "three": "^0.160.0"
+    "three": "^0.160.0",
+    "three-gpu-pathtracer": "^0.0.72"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
