@@ -34,28 +34,49 @@ const state = {
   dyn: 30,
   levels: 10,
   lines: true,
+  // source marker
+  srcPos: [0, 0, 1],
+  srcAtFocus: false,
+  // 3D options
+  multiplane: false,
+  raytrace: false,
 };
 
 // ───────────────────────── views ─────────────────────────
 const plot = new PSFPlot(document.getElementById("plot"));
 const geo = new Geometry3D(document.getElementById("three"));
-plot.onTexture = (cv) => geo.setTexture(cv);
+plot.onTexture = (cv, plane) => geo.setTexture(cv, plane);
 
 const $ = (id) => document.getElementById(id);
 
 // ───────────────────────── control wiring ─────────────────────────
+
+// Slider with paired number input
 function bindSlider(id, key, fmt) {
-  const el = $(id);
+  const slider = $(id);
+  const num = $(`${id}-num`);
   const lab = $("lab-" + id.replace("frequency", "f").replace("diameter", "d"));
-  const sync = () => {
-    state[key] = parseFloat(el.value);
-    if (lab) lab.textContent = fmt(state[key]);
-  };
-  el.addEventListener("input", () => {
-    sync();
-    schedule();
-  });
-  sync();
+
+  function sync(val) {
+    state[key] = val;
+    if (lab) lab.textContent = fmt(val);
+    if (slider.value != val) slider.value = val;
+    if (num && num.value != val) num.value = val;
+  }
+
+  slider.addEventListener("input", () => { sync(parseFloat(slider.value)); schedule(); });
+
+  if (num) {
+    num.addEventListener("input", () => {
+      const v = parseFloat(num.value);
+      if (!isFinite(v)) return;
+      const clamped = Math.min(parseFloat(num.max || Infinity), Math.max(parseFloat(num.min || -Infinity), v));
+      sync(clamped);
+      schedule();
+    });
+  }
+
+  sync(parseFloat(slider.value));
 }
 bindSlider("n", "n", (v) => `${v | 0}`);
 bindSlider("diameter", "diameter", (v) => `${v.toFixed(2)} m`);
@@ -74,17 +95,75 @@ function bindNumber(id, setter) {
 bindNumber("acx", (v) => (state.acenter[0] = v || 0));
 bindNumber("acy", (v) => (state.acenter[1] = v || 0));
 bindNumber("acz", (v) => (state.acenter[2] = v || 0));
-bindNumber("fcx", (v) => (state.fcenter[0] = v || 0));
-bindNumber("fcy", (v) => (state.fcenter[1] = v || 0));
-bindNumber("fcz", (v) => (state.fcenter[2] = v || 0));
-bindNumber("width", (v) => (state.width = v > 0 ? v : state.width));
+
+// Focus center — also drives srcPos when srcAtFocus is on
+function bindFocusCenter(id, axis) {
+  const el = $(id);
+  el.addEventListener("input", () => {
+    const v = parseFloat(el.value) || 0;
+    state.fcenter[axis] = v;
+    if (state.srcAtFocus) {
+      state.srcPos[axis] = v;
+      syncSrcInputs();
+      geo.updateSource(state.srcPos);
+    }
+    schedule();
+  });
+}
+bindFocusCenter("fcx", 0);
+bindFocusCenter("fcy", 1);
+bindFocusCenter("fcz", 2);
+
+bindNumber("width",  (v) => (state.width  = v > 0 ? v : state.width));
 bindNumber("height", (v) => (state.height = v > 0 ? v : state.height));
-bindNumber("c", (v) => (state.c = v > 0 ? v : state.c));
+bindNumber("c",      (v) => (state.c      = v > 0 ? v : state.c));
+
+// Source position
+function syncSrcInputs() {
+  $("srx").value = state.srcPos[0];
+  $("sry").value = state.srcPos[1];
+  $("srz").value = state.srcPos[2];
+}
+function bindSrcAxis(id, axis) {
+  const el = $(id);
+  el.addEventListener("input", () => {
+    if (state.srcAtFocus) return;
+    state.srcPos[axis] = parseFloat(el.value) || 0;
+    geo.updateSource(state.srcPos);
+  });
+}
+bindSrcAxis("srx", 0);
+bindSrcAxis("sry", 1);
+bindSrcAxis("srz", 2);
+
+$("src-at-focus").addEventListener("change", (e) => {
+  state.srcAtFocus = e.target.checked;
+  $("src-pos-fields").style.opacity = state.srcAtFocus ? "0.45" : "1";
+  $("src-pos-fields").style.pointerEvents = state.srcAtFocus ? "none" : "";
+  if (state.srcAtFocus) {
+    state.srcPos = state.fcenter.slice();
+    syncSrcInputs();
+    geo.updateSource(state.srcPos);
+  }
+});
+
+// Multiplane toggle
+$("multiplane").addEventListener("change", (e) => {
+  state.multiplane = e.target.checked;
+  geo.setMultiplane(state.multiplane);
+  schedule();
+});
+
+// Ray-trace toggle
+$("raytrace").addEventListener("change", (e) => {
+  state.raytrace = e.target.checked;
+  $("rt-badge").hidden = !state.raytrace;
+  geo.setRaytrace(state.raytrace);
+});
 
 $("lines").addEventListener("change", (e) => {
   state.lines = e.target.checked;
-  // display-only: re-render last plot without recompute
-  if (lastResult) drawPlot(lastResult);
+  if (lastResults.xy) drawPlot(lastResults[state.fplane] || lastResults.xy);
 });
 
 // segmented controls
@@ -96,9 +175,6 @@ document.querySelectorAll(".seg").forEach((seg) => {
       btn.classList.add("on");
       state[key] = btn.dataset.val;
       if (key === "source") updateSourceVisibility();
-      if (key === "dyn" || key === "levels") {
-        /* n/a */
-      }
       schedule();
     });
   });
@@ -130,37 +206,44 @@ $("csv-input").addEventListener("change", (e) => {
 
 // ───────────────────────── compute pipeline ─────────────────────────
 let timer = 0;
-let lastResult = null;
+// Store per-plane results for the 3D multi-plane view
+const lastResults = { xy: null, xz: null, yz: null };
+
 function schedule() {
   clearTimeout(timer);
   timer = setTimeout(compute, 140);
 }
 
-function buildRequest() {
+function buildRequest(planeName) {
+  const plane = planeName || state.fplane;
   const array =
     state.source === "sunflower"
-      ? {
-          kind: "sunflower",
-          n: state.n,
-          diameter: state.diameter,
-          center: state.acenter.slice(),
-          plane: state.aplane,
-        }
+      ? { kind: "sunflower", n: state.n, diameter: state.diameter, center: state.acenter.slice(), plane: state.aplane }
       : { kind: "csv", text: state.csvText || "" };
+
+  // Choose a sensible default center for off-axis planes:
+  // the user's focus center, but mapped into the correct axes
+  const center = state.fcenter.slice();
+
   const focus = {
-    center: state.fcenter.slice(),
-    plane: state.fplane,
+    center,
+    plane,
     width: state.width,
     height: state.height,
     dx: state.dx,
   };
-  return {
-    array,
-    focus,
-    frequency: state.frequency,
-    speed_of_sound: state.c,
-    shading: state.shading,
-  };
+  return { array, focus, frequency: state.frequency, speed_of_sound: state.c, shading: state.shading };
+}
+
+async function computePlane(planeName) {
+  try {
+    const inv = await getInvoke();
+    return inv
+      ? await inv("compute", { req: buildRequest(planeName) })
+      : jsCompute(buildRequest(planeName));
+  } catch (e) {
+    throw typeof e === "string" ? e : (e.message || "Compute failed.");
+  }
 }
 
 async function compute() {
@@ -168,20 +251,34 @@ async function compute() {
     toast("Load a CSV of microphone positions first.");
     return;
   }
-  let res;
+
   try {
-    const inv = await getInvoke();
-    res = inv
-      ? await inv("compute", { req: buildRequest() })
-      : jsCompute(buildRequest());
+    // Always compute the primary (fplane) result for the 2D panel
+    const primary = await computePlane(state.fplane);
+    lastResults[state.fplane] = primary;
+    drawPlot(primary);
+    updateReadouts(primary);
+
+    if (state.multiplane) {
+      // Compute the other two planes in parallel
+      const others = ["xy", "xz", "yz"].filter((p) => p !== state.fplane);
+      const [r1, r2] = await Promise.all(others.map((p) => computePlane(p).catch(() => null)));
+      lastResults[others[0]] = r1;
+      lastResults[others[1]] = r2;
+
+      // Send textures for other planes to the 3D view
+      others.forEach((p, i) => {
+        const r = [r1, r2][i];
+        if (r) renderOffscreenTexture(r, p);
+      });
+    }
+
+    // Update 3D geometry (always use primary for mics/corners)
+    geo.update(primary.mics, primary.weights, primary.corners, state.fplane, lastResults, state.multiplane);
+    geo.updateSource(state.srcPos);
   } catch (e) {
-    toast(typeof e === "string" ? e : e.message || "Compute failed.");
-    return;
+    toast(e);
   }
-  lastResult = res;
-  drawPlot(res);
-  geo.update(res.mics, res.weights, res.corners);
-  updateReadouts(res);
 }
 
 function drawPlot(res) {
@@ -201,6 +298,19 @@ function drawPlot(res) {
   $("psf-plane").textContent = " · " + state.fplane;
 }
 
+// Render a PSF result into an offscreen canvas and push the texture to geo
+function renderOffscreenTexture(res, plane) {
+  const cv = document.createElement("canvas");
+  const SIZE = 256;
+  cv.width = cv.height = SIZE;
+  const ctx = cv.getContext("2d");
+  plot.renderTexture(
+    { ...res, dynamicDb: state.dyn, levels: state.levels },
+    cv, ctx
+  );
+  geo.setTexture(cv, plane);
+}
+
 // ───────────────────────── readouts ─────────────────────────
 const fmtFreq = (hz) => (hz >= 1000 ? `${(hz / 1000).toFixed(2)} kHz` : `${hz | 0} Hz`);
 const fmtLen = (m) =>
@@ -217,8 +327,7 @@ function updateReadouts(res) {
   const bu = m.beamwidth_u != null ? (m.beamwidth_u * 1000).toFixed(0) : "—";
   const bv = m.beamwidth_v != null ? (m.beamwidth_v * 1000).toFixed(0) : "—";
   $("m-bw").textContent = `${bu} × ${bv} mm`;
-  $("m-psl").textContent =
-    m.peak_sidelobe_db != null ? `${m.peak_sidelobe_db.toFixed(1)} dB` : "—";
+  $("m-psl").textContent = m.peak_sidelobe_db != null ? `${m.peak_sidelobe_db.toFixed(1)} dB` : "—";
   $("m-alias").textContent = m.alias_frequency ? fmtFreq(m.alias_frequency) : "—";
 
   const st = $("m-state");
@@ -242,17 +351,15 @@ function toast(msg) {
 }
 
 // ════════════════════════ JS fallback engine ════════════════════════
-// Faithful, compact port of psf-core so the app also runs as a web preview.
 const GOLDEN = 2.399963229728653;
 function planeBasis(p) {
   if (p === "xz") return [[1, 0, 0], [0, 0, 1]];
   if (p === "yz") return [[0, 1, 0], [0, 0, 1]];
   return [[1, 0, 0], [0, 1, 0]];
 }
-const vadd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-const vscale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
-const vdist = (a, b) =>
-  Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const vadd   = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const vscale = (a, s) => [a[0]*s,    a[1]*s,    a[2]*s];
+const vdist  = (a, b) => Math.hypot(a[0]-b[0], a[1]-b[1], a[2]-b[2]);
 
 function buildArrayJS(req) {
   const a = req.array;
@@ -261,35 +368,28 @@ function buildArrayJS(req) {
     const r0 = a.diameter / 2;
     const pos = [];
     for (let k = 0; k < a.n; k++) {
-      const r = r0 * Math.sqrt((k + 0.5) / a.n);
+      const r  = r0 * Math.sqrt((k + 0.5) / a.n);
       const th = k * GOLDEN;
-      pos.push(
-        vadd(a.center, vadd(vscale(uh, r * Math.cos(th)), vscale(vh, r * Math.sin(th))))
-      );
+      pos.push(vadd(a.center, vadd(vscale(uh, r*Math.cos(th)), vscale(vh, r*Math.sin(th)))));
     }
     return { pos, weights: null };
   }
-  // CSV
-  const pos = [];
-  const w = [];
+  const pos = [], w = [];
   let anyW = false;
   for (const raw of a.text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const f = line.split(/[,;\t ]+/).filter(Boolean).map(Number);
-    if (f.length < 3 || f.slice(0, 3).some((x) => !isFinite(x))) continue;
+    if (f.length < 3 || f.slice(0,3).some((x) => !isFinite(x))) continue;
     pos.push([f[0], f[1], f[2]]);
-    if (f.length >= 4 && isFinite(f[3])) {
-      w.push(f[3]);
-      anyW = true;
-    } else w.push(1);
+    if (f.length >= 4 && isFinite(f[3])) { w.push(f[3]); anyW = true; } else w.push(1);
   }
   if (!pos.length) throw "No microphone rows found (need 3 numeric columns).";
   return { pos, weights: anyW ? w : null };
 }
 
 function centroid(pos) {
-  const s = pos.reduce((a, p) => vadd(a, p), [0, 0, 0]);
+  const s = pos.reduce((a,p) => vadd(a,p), [0,0,0]);
   return vscale(s, 1 / Math.max(1, pos.length));
 }
 function weightsForJS(arr, shading) {
@@ -297,77 +397,57 @@ function weightsForJS(arr, shading) {
   if (shading === "hann") {
     const c = centroid(arr.pos);
     const rmax = Math.max(1e-12, ...arr.pos.map((p) => vdist(p, c)));
-    return arr.pos.map((p) => {
-      const rho = Math.min(1, vdist(p, c) / rmax);
-      return 0.5 * (1 + Math.cos(Math.PI * rho));
-    });
+    return arr.pos.map((p) => { const rho = Math.min(1, vdist(p,c)/rmax); return 0.5*(1+Math.cos(Math.PI*rho)); });
   }
   return arr.pos.map(() => 1);
 }
 
 function gridJS(focus) {
-  const nx = Math.max(1, Math.round(focus.width / focus.dx)) + 1;
+  const nx = Math.max(1, Math.round(focus.width  / focus.dx)) + 1;
   const ny = Math.max(1, Math.round(focus.height / focus.dx)) + 1;
-  const u = Array.from({ length: nx }, (_, i) => -focus.width / 2 + i * focus.dx);
-  const v = Array.from({ length: ny }, (_, j) => -focus.height / 2 + j * focus.dx);
+  const u  = Array.from({ length: nx }, (_, i) => -focus.width /2 + i*focus.dx);
+  const v  = Array.from({ length: ny }, (_, j) => -focus.height/2 + j*focus.dx);
   const [uh, vh] = planeBasis(focus.plane);
-  const P = (uu, vv) => vadd(focus.center, vadd(vscale(uh, uu), vscale(vh, vv)));
-  const corners = [
-    P(u[0], v[0]),
-    P(u[nx - 1], v[0]),
-    P(u[nx - 1], v[ny - 1]),
-    P(u[0], v[ny - 1]),
-  ];
+  const P = (uu, vv) => vadd(focus.center, vadd(vscale(uh,uu), vscale(vh,vv)));
+  const corners = [P(u[0],v[0]), P(u[nx-1],v[0]), P(u[nx-1],v[ny-1]), P(u[0],v[ny-1])];
   return { nx, ny, u, v, corners, uh, vh };
 }
 
 function jsCompute(req) {
-  const arr = buildArrayJS(req);
+  const arr     = buildArrayJS(req);
   const weights = weightsForJS(arr, req.shading);
-  const f = req.focus;
-  const g = gridJS(f);
-  const k = (2 * Math.PI * req.frequency) / req.speed_of_sound;
-  const d0 = arr.pos.map((m) => vdist(m, f.center));
-  const wsum = weights.reduce((a, b) => a + b, 0) || 1;
-  const values = new Float32Array(g.nx * g.ny);
+  const f       = req.focus;
+  const g       = gridJS(f);
+  const k       = (2 * Math.PI * req.frequency) / req.speed_of_sound;
+  const d0      = arr.pos.map((m) => vdist(m, f.center));
+  const wsum    = weights.reduce((a,b) => a+b, 0) || 1;
+  const values  = new Float32Array(g.nx * g.ny);
   for (let j = 0; j < g.ny; j++) {
     for (let i = 0; i < g.nx; i++) {
       const pt = vadd(f.center, vadd(vscale(g.uh, g.u[i]), vscale(g.vh, g.v[j])));
-      let re = 0,
-        im = 0;
+      let re = 0, im = 0;
       for (let mi = 0; mi < arr.pos.length; mi++) {
         const ph = k * (vdist(arr.pos[mi], pt) - d0[mi]);
         re += weights[mi] * Math.cos(ph);
         im += weights[mi] * Math.sin(ph);
       }
-      const p = ((re * re + im * im) / (wsum * wsum)) + 1e-30;
-      values[j * g.nx + i] = Math.max(-300, 10 * Math.log10(p));
+      const p = (re*re + im*im) / (wsum*wsum) + 1e-30;
+      values[j*g.nx+i] = Math.max(-300, 10*Math.log10(p));
     }
   }
   const metrics = metricsJS(arr, g, values, req.speed_of_sound);
-  return {
-    mics: arr.pos,
-    weights,
-    nx: g.nx,
-    ny: g.ny,
-    u: g.u,
-    v: g.v,
-    corners: g.corners,
-    values,
-    metrics,
-  };
+  return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, metrics };
 }
 
 function halfWidth(coords, line, center, fwd) {
   let idx = center;
   for (;;) {
-    const next = fwd ? idx + 1 : idx - 1;
+    const next = fwd ? idx+1 : idx-1;
     if (next < 0 || next >= coords.length) return null;
     if (line[next] <= -3) {
-      const a = line[idx],
-        b = line[next];
-      const frac = Math.abs(a - b) < 1e-9 ? 0 : (a + 3) / (a - b);
-      return Math.abs(coords[idx] + frac * (coords[next] - coords[idx]) - coords[center]);
+      const a = line[idx], b = line[next];
+      const frac = Math.abs(a-b) < 1e-9 ? 0 : (a+3)/(a-b);
+      return Math.abs(coords[idx] + frac*(coords[next]-coords[idx]) - coords[center]);
     }
     idx = next;
   }
@@ -375,104 +455,78 @@ function halfWidth(coords, line, center, fwd) {
 function firstNull(line, center, fwd, len) {
   let idx = center;
   for (;;) {
-    const next = fwd ? idx + 1 : idx - 1;
+    const next = fwd ? idx+1 : idx-1;
     if (next < 0 || next >= len) return len;
-    if (line[next] > line[idx] && idx !== center) return Math.abs(idx - center);
+    if (line[next] > line[idx] && idx !== center) return Math.abs(idx-center);
     idx = next;
   }
 }
 function metricsJS(arr, g, values, c) {
   const { nx, ny, u, v } = g;
-  const cx = nx >> 1,
-    cy = ny >> 1;
-  const row = Array.from({ length: nx }, (_, i) => values[cy * nx + i]);
-  const col = Array.from({ length: ny }, (_, j) => values[j * nx + cx]);
-  const bwU =
-    halfWidth(u, row, cx, true) != null && halfWidth(u, row, cx, false) != null
-      ? halfWidth(u, row, cx, true) + halfWidth(u, row, cx, false)
-      : null;
-  const bwV =
-    halfWidth(v, col, cy, true) != null && halfWidth(v, col, cy, false) != null
-      ? halfWidth(v, col, cy, true) + halfWidth(v, col, cy, false)
-      : null;
+  const cx = nx >> 1, cy = ny >> 1;
+  const row = Array.from({ length: nx }, (_, i) => values[cy*nx+i]);
+  const col = Array.from({ length: ny }, (_, j) => values[j*nx+cx]);
+  const bwU = halfWidth(u,row,cx,true) != null && halfWidth(u,row,cx,false) != null
+    ? halfWidth(u,row,cx,true) + halfWidth(u,row,cx,false) : null;
+  const bwV = halfWidth(v,col,cy,true) != null && halfWidth(v,col,cy,false) != null
+    ? halfWidth(v,col,cy,true) + halfWidth(v,col,cy,false) : null;
   const nr = Math.max(
-    firstNull(row, cx, true, nx),
-    firstNull(row, cx, false, nx),
-    firstNull(col, cy, true, ny),
-    firstNull(col, cy, false, ny)
+    firstNull(row,cx,true,nx), firstNull(row,cx,false,nx),
+    firstNull(col,cy,true,ny), firstNull(col,cy,false,ny)
   );
   let psl = null;
-  if (nr < Math.max(nx, ny)) {
+  if (nr < Math.max(nx,ny)) {
     let best = -300;
     for (let j = 0; j < ny; j++)
       for (let i = 0; i < nx; i++) {
-        const du = (i - cx) / Math.max(1, nr),
-          dv = (j - cy) / Math.max(1, nr);
-        if (du * du + dv * dv > 1) best = Math.max(best, values[j * nx + i]);
+        const du = (i-cx)/Math.max(1,nr), dv = (j-cy)/Math.max(1,nr);
+        if (du*du+dv*dv > 1) best = Math.max(best, values[j*nx+i]);
       }
     if (best > -300) psl = best;
   }
-  let dmin = Infinity,
-    aperture = 0;
+  let dmin = Infinity, aperture = 0;
   for (let a = 0; a < arr.pos.length; a++)
-    for (let b = a + 1; b < arr.pos.length; b++) {
+    for (let b = a+1; b < arr.pos.length; b++) {
       const d = vdist(arr.pos[a], arr.pos[b]);
       if (d < dmin) dmin = d;
       if (d > aperture) aperture = d;
     }
   return {
-    beamwidth_u: bwU,
-    beamwidth_v: bwV,
-    peak_sidelobe_db: psl,
-    alias_frequency: isFinite(dmin) && dmin > 0 ? c / (2 * dmin) : null,
-    aperture,
-    n_mics: arr.pos.length,
+    beamwidth_u: bwU, beamwidth_v: bwV, peak_sidelobe_db: psl,
+    alias_frequency: isFinite(dmin) && dmin > 0 ? c/(2*dmin) : null,
+    aperture, n_mics: arr.pos.length,
   };
 }
 
 // ───────────────────────── ambient interference field ─────────────────────────
 (function ambientField() {
-  const cv = document.getElementById("field");
+  const cv  = document.getElementById("field");
   const ctx = cv.getContext("2d");
   const RES = 150;
-  cv.width = RES;
-  cv.height = RES;
-  cv.style.width = "100vw";
-  cv.style.height = "100vh";
+  cv.width = RES; cv.height = RES;
+  cv.style.width = "100vw"; cv.style.height = "100vh";
   const img = ctx.createImageData(RES, RES);
   const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const sources = [
-    [0.3, 0.35],
-    [0.72, 0.28],
-    [0.5, 0.78],
-  ];
+  const sources = [[0.3,0.35],[0.72,0.28],[0.5,0.78]];
   function frame(t) {
-    const ph = t * 0.00015;
-    let o = 0;
+    const ph = t * 0.00015; let o = 0;
     for (let y = 0; y < RES; y++) {
       for (let x = 0; x < RES; x++) {
-        const fx = x / RES,
-          fy = y / RES;
+        const fx = x/RES, fy = y/RES;
         let s = 0;
         for (let k = 0; k < sources.length; k++) {
-          const dx = fx - sources[k][0],
-            dy = fy - sources[k][1];
-          const r = Math.sqrt(dx * dx + dy * dy);
-          s += Math.sin(r * 70 - ph * (1 + k * 0.3));
+          const dx = fx-sources[k][0], dy = fy-sources[k][1];
+          s += Math.sin(Math.sqrt(dx*dx+dy*dy)*70 - ph*(1+k*0.3));
         }
-        const val = (s / sources.length) * 0.5 + 0.5;
-        // turbo-ish cool tint, kept dark; CSS opacity flattens it
-        img.data[o++] = 30 + val * 40;
-        img.data[o++] = 90 + val * 80;
-        img.data[o++] = 150 + val * 90;
-        img.data[o++] = 255;
+        const val = (s/sources.length)*0.5+0.5;
+        img.data[o++] = 30+val*40; img.data[o++] = 90+val*80;
+        img.data[o++] = 150+val*90; img.data[o++] = 255;
       }
     }
     ctx.putImageData(img, 0, 0);
     if (!reduce) requestAnimationFrame(frame);
   }
-  if (reduce) frame(0);
-  else requestAnimationFrame(frame);
+  if (reduce) frame(0); else requestAnimationFrame(frame);
 })();
 
 // ───────────────────────── go ─────────────────────────

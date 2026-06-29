@@ -127,7 +127,7 @@ export class PSFPlot {
         tctx.stroke();
       }
     }
-    if (this.onTexture) this.onTexture(this.textureCanvas);
+    if (this.onTexture) this.onTexture(this.textureCanvas, args.planeLabel);
 
     // ── compose full display into an offscreen canvas ──
     const off = document.createElement("canvas");
@@ -251,6 +251,34 @@ export class PSFPlot {
       this._raf = requestAnimationFrame(tick);
     }
     this.prev = off;
+  }
+
+  // Render a PSF result into an existing canvas/context (no axes, used for off-plane textures).
+  renderTexture(res, canvas, ctx) {
+    const { values, nx, ny, dynamicDb = 30, levels = 10 } = res;
+    const W = canvas.width, H = canvas.height;
+    const clamped = new Float64Array(values.length);
+    for (let i = 0; i < values.length; i++)
+      clamped[i] = Math.max(-dynamicDb, Math.min(0, values[i]));
+    const thr = [];
+    for (let i = 0; i <= levels; i++) thr.push(-dynamicDb + (dynamicDb * i) / levels);
+    const geoms = d3contours().size([nx, ny]).thresholds(thr)(clamped);
+    const tx = (gx) => (gx / (nx - 1)) * W;
+    const ty = (gy) => H - (gy / (ny - 1)) * H;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = interpolateTurbo(0);
+    ctx.fillRect(0, 0, W, H);
+    for (const g of geoms) {
+      const s = (g.value + dynamicDb) / dynamicDb;
+      ctx.fillStyle = interpolateTurbo(Math.max(0, Math.min(1, s)));
+      ctx.beginPath();
+      for (const poly of g.coordinates)
+        for (const ring of poly) {
+          ring.forEach(([x, y], i) => i ? ctx.lineTo(tx(x), ty(y)) : ctx.moveTo(tx(x), ty(y)));
+          ctx.closePath();
+        }
+      ctx.fill("evenodd");
+    }
   }
 }
 

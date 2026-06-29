@@ -208,6 +208,18 @@ input[type="range"]:active::-webkit-slider-thumb {
   box-shadow: 0 0 0 7px rgba(88,212,255,0.18), 0 0 16px 0 var(--accent-glow);
 }
 
+/* slider + inline number */
+.slider-num-row {
+  display: flex; align-items: center; gap: 8px;
+}
+.slider-num-row input[type="range"] { flex: 1; }
+.slider-num {
+  width: 68px !important;
+  flex: none;
+  padding: 5px 7px !important;
+  font-size: 11.5px !important;
+}
+
 /* number inputs */
 input[type="number"], .file-btn {
   width: 100%;
@@ -273,6 +285,17 @@ input[type="number"]:focus, .file-btn:focus-visible {
   box-shadow: 0 16px 40px -24px rgba(0, 0, 0, 0.8), inset 0 1px 0 0 var(--panel-hi);
   overflow: hidden;
 }
+.rt-badge {
+  color: var(--accent);
+  font-size: 9.5px;
+  letter-spacing: 0.5px;
+  animation: pulse-badge 2s ease-in-out infinite;
+}
+@keyframes pulse-badge {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+
 .panel-label {
   position: absolute; top: 12px; left: 14px; z-index: 3;
   font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 1px;
