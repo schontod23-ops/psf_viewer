@@ -11,7 +11,9 @@ let PathTracerModule = null;
 async function loadPathTracer() {
   if (PathTracerModule) return PathTracerModule;
   try {
-    PathTracerModule = await import("three-gpu-pathtracer");
+    // @vite-ignore — optional, not bundled; resolved only if the package is
+    // present at runtime. Absence is caught below and falls back to WebGL.
+    PathTracerModule = await import(/* @vite-ignore */ "three-gpu-pathtracer");
     return PathTracerModule;
   } catch {
     return null;
