@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+time = "=0.3.51"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,7 +22,7 @@ psf-core = { path = "../psf-core" }
 # Pin: time >= 0.3.52 changed the `Parsable::parse` signature, which breaks the
 # transitive `cookie` 0.18.1 dependency (pulled in via tauri). Force the last
 # compatible release so a fresh dependency resolve in CI compiles cleanly.
-time = "=0.3.51"
+
 
 # Small, fast release binary.
 [profile.release]
