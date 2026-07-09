@@ -24,6 +24,7 @@
           <div class="stat"><span class="k">f</span><span class="v" id="st-f">—</span></div>
           <div class="stat"><span class="k">λ</span><span class="v" id="st-lambda">—</span></div>
           <div class="stat"><span class="k">f<sub>alias</sub></span><span class="v" id="st-alias">—</span></div>
+          <button class="icon-btn" id="settings-btn" title="Slider bounds settings" aria-label="Slider bounds settings">⚙</button>
         </div>
       </header>
 
@@ -209,6 +210,61 @@
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <!-- ───────────────────────── settings modal ───────────────────────── -->
+    <div class="modal-overlay" id="settings-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="modal-head">
+          <h2 id="settings-title">Slider bounds</h2>
+          <button class="modal-close" id="settings-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="modal-col-heads">
+            <span>Slider</span><span>Min</span><span>Max</span><span>Step</span>
+          </div>
+          <div class="modal-row">
+            <span class="row-label">Microphones</span>
+            <input type="number" id="set-n-min" step="1" aria-label="microphones min" />
+            <input type="number" id="set-n-max" step="1" aria-label="microphones max" />
+            <input type="number" id="set-n-step" step="1" aria-label="microphones step" />
+          </div>
+          <div class="modal-row">
+            <span class="row-label">Diameter (m)</span>
+            <input type="number" id="set-diameter-min" step="any" aria-label="diameter min" />
+            <input type="number" id="set-diameter-max" step="any" aria-label="diameter max" />
+            <input type="number" id="set-diameter-step" step="any" aria-label="diameter step" />
+          </div>
+          <div class="modal-row">
+            <span class="row-label">Grid step dx (m)</span>
+            <input type="number" id="set-dx-min" step="any" aria-label="grid step dx min" />
+            <input type="number" id="set-dx-max" step="any" aria-label="grid step dx max" />
+            <input type="number" id="set-dx-step" step="any" aria-label="grid step dx step" />
+          </div>
+          <div class="modal-row">
+            <span class="row-label">Frequency (Hz)</span>
+            <input type="number" id="set-frequency-min" step="any" aria-label="frequency min" />
+            <input type="number" id="set-frequency-max" step="any" aria-label="frequency max" />
+            <input type="number" id="set-frequency-step" step="any" aria-label="frequency step" />
+          </div>
+          <div class="modal-row">
+            <span class="row-label">Dynamic range (dB)</span>
+            <input type="number" id="set-dyn-min" step="any" aria-label="dynamic range min" />
+            <input type="number" id="set-dyn-max" step="any" aria-label="dynamic range max" />
+            <input type="number" id="set-dyn-step" step="any" aria-label="dynamic range step" />
+          </div>
+          <div class="modal-row">
+            <span class="row-label">Contour bands</span>
+            <input type="number" id="set-levels-min" step="1" aria-label="contour bands min" />
+            <input type="number" id="set-levels-max" step="1" aria-label="contour bands max" />
+            <input type="number" id="set-levels-step" step="1" aria-label="contour bands step" />
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="settings-reset">Reset to defaults</button>
+          <button class="file-btn" id="settings-apply">Apply</button>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="/src/main.js"></script>
   </body>

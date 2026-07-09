@@ -314,17 +314,19 @@ impl FocusConfig {
 // ─────────────────────────────────────────────────────────── beamformer
 
 /// Compute the normalised PSF (dB) over the focus grid, using a rank-1
-/// cross-spectral matrix `C = p·pᴴ` built from a single unit point source
-/// (`p_m` = free-field pressure at mic `m`), steered with the chosen Sarradj
-/// formulation. With `diag_removal` the CSM diagonal (autopower) terms are
-/// subtracted before computing the beamformer output, i.e.
+/// cross-spectral matrix `C = p·pᴴ` built from a single unit point source at
+/// `source` (`p_m` = free-field pressure at mic `m`), steered with the
+/// chosen Sarradj formulation. `source` need not lie on (or even near) the
+/// scanned focus plane. With `diag_removal` the CSM diagonal (autopower)
+/// terms are subtracted before computing the beamformer output, i.e.
 ///   P(t) = hᴴ(t)·C·h(t) − diag_removal · Σ_m |h_m(t)|²|p_m|²
 /// Returns row-major values (`v` outer, `u` inner), length `nx*ny`, in dB
-/// relative to the value at the focus centre (peak = 0 dB there).
+/// relative to the grid's peak value (peak = 0 dB).
 pub fn compute_psf(
     array: &Array,
     weights: &[f64],
     focus: &FocusConfig,
+    source: [f64; 3],
     frequency: f64,
     speed_of_sound: f64,
     formulation: SteeringFormulation,
@@ -340,7 +342,6 @@ pub fn compute_psf(
     let (uh, vh, _) = focus.plane.basis();
     let k = 2.0 * std::f64::consts::PI * frequency / speed_of_sound;
 
-    let source = focus.center;
     let reference = array.centroid();
     let mics = &array.pos;
 
@@ -422,9 +423,9 @@ pub fn compute_psf(
             }
         });
 
-    let cx = grid.nx / 2;
-    let cy = grid.ny / 2;
-    let p0 = raw[cy * grid.nx + cx].max(1e-30);
+    // Normalise to the grid's own peak rather than assuming the source sits
+    // at the geometric centre of the scan grid — it may not (see `source`).
+    let p0 = raw.iter().cloned().fold(0.0f64, f64::max).max(1e-30);
 
     let values: Vec<f32> = raw
         .iter()
@@ -506,8 +507,16 @@ fn first_null(line: &[f32], center: usize, forward: bool, len: usize) -> usize {
 
 pub fn metrics(array: &Array, grid: &Grid, values: &[f32], frequency_c: f64) -> Metrics {
     let (nx, ny) = (grid.nx, grid.ny);
-    let cx = nx / 2;
-    let cy = ny / 2;
+    // The mainlobe peak (normalised to exactly 0 dB) isn't necessarily at the
+    // grid's geometric middle — the source can sit anywhere. Locate it.
+    let peak_idx = values
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let cx = peak_idx % nx;
+    let cy = peak_idx / nx;
 
     // center row (constant v) and center column (constant u)
     let row: Vec<f32> = (0..nx).map(|i| values[cy * nx + i]).collect();
@@ -643,6 +652,7 @@ mod tests {
             &a,
             &w,
             &focus(),
+            focus().center,
             5000.0,
             343.0,
             SteeringFormulation::I,
@@ -666,6 +676,7 @@ mod tests {
             &a,
             &w,
             &focus(),
+            focus().center,
             4000.0,
             343.0,
             SteeringFormulation::I,
@@ -687,10 +698,12 @@ mod tests {
         let w = weights_for(&a, Shading::Uniform);
         let f = focus();
         let (g1, v1) =
-            compute_psf(&a, &w, &f, 2000.0, 343.0, SteeringFormulation::I, false).unwrap();
+            compute_psf(&a, &w, &f, f.center, 2000.0, 343.0, SteeringFormulation::I, false)
+                .unwrap();
         let m1 = metrics(&a, &g1, &v1, 343.0);
         let (g2, v2) =
-            compute_psf(&a, &w, &f, 8000.0, 343.0, SteeringFormulation::I, false).unwrap();
+            compute_psf(&a, &w, &f, f.center, 8000.0, 343.0, SteeringFormulation::I, false)
+                .unwrap();
         let m2 = metrics(&a, &g2, &v2, 343.0);
         let b1 = m1.beamwidth_u.unwrap();
         let b2 = m2.beamwidth_u.unwrap();
@@ -705,6 +718,7 @@ mod tests {
             &a,
             &w,
             &focus(),
+            focus().center,
             3000.0,
             343.0,
             SteeringFormulation::I,
@@ -743,6 +757,7 @@ mod tests {
                     &a,
                     &w,
                     &near_focus(),
+                    near_focus().center,
                     4000.0,
                     343.0,
                     formulation,
@@ -773,6 +788,7 @@ mod tests {
             &a,
             &w,
             &near_focus(),
+            near_focus().center,
             4000.0,
             343.0,
             SteeringFormulation::I,
@@ -783,6 +799,7 @@ mod tests {
             &a,
             &w,
             &near_focus(),
+            near_focus().center,
             4000.0,
             343.0,
             SteeringFormulation::Iii,
@@ -812,6 +829,7 @@ mod tests {
             &a,
             &w,
             &near_focus(),
+            near_focus().center,
             4000.0,
             343.0,
             SteeringFormulation::I,
@@ -821,5 +839,44 @@ mod tests {
         assert!(vals.iter().all(|v| v.is_finite() && *v <= 1e-3));
         let center = vals[(g.ny / 2) * g.nx + (g.nx / 2)];
         assert!(center.abs() < 1e-3, "center should be 0 dB, got {center}");
+    }
+
+    #[test]
+    fn source_position_actually_moves_the_psf_peak() {
+        // Regression test: the source used to be hard-coded to focus.center,
+        // so moving it had no effect on the computed field. The peak should
+        // now track wherever `source` actually is on the focus plane.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+
+        let (g0, v0) =
+            compute_psf(&a, &w, &f, f.center, 5000.0, 343.0, SteeringFormulation::I, false)
+                .unwrap();
+        let peak0 = v0
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        assert_eq!(peak0, (g0.ny / 2) * g0.nx + (g0.nx / 2));
+
+        // Offset the source within the focus plane (still z=1, but shifted
+        // in x) — the peak must move with it, not stay at the grid centre.
+        let offset_source = [0.3, 0.0, 1.0];
+        let (g1, v1) =
+            compute_psf(&a, &w, &f, offset_source, 5000.0, 343.0, SteeringFormulation::I, false)
+                .unwrap();
+        let peak1 = v1
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        assert_ne!(
+            peak1,
+            (g1.ny / 2) * g1.nx + (g1.nx / 2),
+            "moving the source should move the PSF peak away from the grid centre"
+        );
     }
 }

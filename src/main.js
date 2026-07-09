@@ -87,6 +87,99 @@ bindSlider("frequency", "frequency", (v) => `${v | 0} Hz`);
 bindSlider("dyn", "dyn", (v) => `${v | 0} dB`);
 bindSlider("levels", "levels", (v) => `${v | 0}`);
 
+// ───────────────────────── slider bounds settings ─────────────────────────
+// Per-slider min/max/step, editable at runtime and persisted so users can
+// widen (or narrow) the ranges baked into the HTML defaults.
+const SLIDER_DEFAULT_BOUNDS = {
+  n: { min: 4, max: 256, step: 1 },
+  diameter: { min: 0.05, max: 3, step: 0.01 },
+  dx: { min: 0.005, max: 0.1, step: 0.005 },
+  frequency: { min: 100, max: 20000, step: 50 },
+  dyn: { min: 6, max: 60, step: 1 },
+  levels: { min: 4, max: 24, step: 1 },
+};
+const SLIDER_BOUNDS_KEY = "psf-viewer:slider-bounds";
+
+function loadSliderBounds() {
+  let stored = {};
+  try {
+    stored = JSON.parse(localStorage.getItem(SLIDER_BOUNDS_KEY) || "{}");
+  } catch {
+    stored = {};
+  }
+  const merged = {};
+  for (const id in SLIDER_DEFAULT_BOUNDS) {
+    merged[id] = { ...SLIDER_DEFAULT_BOUNDS[id], ...(stored[id] || {}) };
+  }
+  return merged;
+}
+let sliderBounds = loadSliderBounds();
+
+function applySliderBounds(id, bounds) {
+  const slider = $(id);
+  const num = $(`${id}-num`);
+  for (const el of [slider, num]) {
+    if (!el) continue;
+    el.min = bounds.min;
+    el.max = bounds.max;
+    el.step = bounds.step;
+  }
+  const clamped = Math.min(bounds.max, Math.max(bounds.min, parseFloat(slider.value)));
+  slider.value = clamped;
+  if (num) num.value = clamped;
+  slider.dispatchEvent(new Event("input"));
+}
+
+function applyAllSliderBounds() {
+  for (const id in sliderBounds) applySliderBounds(id, sliderBounds[id]);
+}
+applyAllSliderBounds();
+
+function openSettings() {
+  for (const id in sliderBounds) {
+    $(`set-${id}-min`).value = sliderBounds[id].min;
+    $(`set-${id}-max`).value = sliderBounds[id].max;
+    $(`set-${id}-step`).value = sliderBounds[id].step;
+  }
+  $("settings-overlay").hidden = false;
+}
+function closeSettings() {
+  $("settings-overlay").hidden = true;
+}
+$("settings-btn").addEventListener("click", openSettings);
+$("settings-close").addEventListener("click", closeSettings);
+$("settings-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "settings-overlay") closeSettings();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("settings-overlay").hidden) closeSettings();
+});
+
+$("settings-apply").addEventListener("click", () => {
+  const next = {};
+  for (const id in SLIDER_DEFAULT_BOUNDS) {
+    const min = parseFloat($(`set-${id}-min`).value);
+    const max = parseFloat($(`set-${id}-max`).value);
+    const step = parseFloat($(`set-${id}-step`).value);
+    if (![min, max, step].every(isFinite) || step <= 0 || max <= min) {
+      toast(`Invalid bounds for "${id}" — max must exceed min, step must be positive.`);
+      return;
+    }
+    next[id] = { min, max, step };
+  }
+  sliderBounds = next;
+  localStorage.setItem(SLIDER_BOUNDS_KEY, JSON.stringify(sliderBounds));
+  applyAllSliderBounds();
+  closeSettings();
+});
+
+$("settings-reset").addEventListener("click", () => {
+  sliderBounds = JSON.parse(JSON.stringify(SLIDER_DEFAULT_BOUNDS));
+  localStorage.removeItem(SLIDER_BOUNDS_KEY);
+  applyAllSliderBounds();
+  openSettings();
+});
+
 function bindNumber(id, setter) {
   const el = $(id);
   el.addEventListener("input", () => {
@@ -132,6 +225,7 @@ function bindSrcAxis(id, axis) {
     if (state.srcAtFocus) return;
     state.srcPos[axis] = parseFloat(el.value) || 0;
     geo.updateSource(state.srcPos);
+    schedule();
   });
 }
 bindSrcAxis("srx", 0);
@@ -147,6 +241,7 @@ $("src-at-focus").addEventListener("change", (e) => {
     syncSrcInputs();
     geo.updateSource(state.srcPos);
   }
+  schedule();
 });
 
 // Multiplane toggle
@@ -243,6 +338,7 @@ function buildRequest(planeName) {
   return {
     array,
     focus,
+    source: state.srcPos.slice(),
     frequency: state.frequency,
     speed_of_sound: state.c,
     shading: state.shading,
@@ -444,10 +540,11 @@ function jsCompute(req) {
   const reference = centroid(arr.pos);
   const formulation = req.steering || "I";
   const diagRemoval  = !!req.diag_removal;
+  const source = req.source || f.center;
 
   // actual free-field pressure at each mic from the unit source
   const p = arr.pos.map((m) => {
-    const d = Math.max(1e-9, vdist(m, f.center));
+    const d = Math.max(1e-9, vdist(m, source));
     const ph = -k * d;
     return [Math.cos(ph) / d, Math.sin(ph) / d];
   });
@@ -501,8 +598,9 @@ function jsCompute(req) {
     }
   }
 
-  const cx = g.nx >> 1, cy = g.ny >> 1;
-  const p0 = Math.max(1e-30, raw[cy * g.nx + cx]);
+  // Normalise to the grid's own peak — the source (and thus the peak) need
+  // not sit at the grid's geometric centre.
+  const p0 = Math.max(1e-30, raw.reduce((a, b) => Math.max(a, b), 0));
   const values = new Float32Array(g.nx * g.ny);
   for (let idx = 0; idx < raw.length; idx++) {
     values[idx] = Math.max(-300, 10 * Math.log10(raw[idx] / p0 + 1e-30));
@@ -536,7 +634,13 @@ function firstNull(line, center, fwd, len) {
 }
 function metricsJS(arr, g, values, c) {
   const { nx, ny, u, v } = g;
-  const cx = nx >> 1, cy = ny >> 1;
+  // The mainlobe peak (normalised to exactly 0 dB) isn't necessarily at the
+  // grid's geometric middle — the source can sit anywhere. Locate it.
+  let peakIdx = 0;
+  for (let idx = 1; idx < values.length; idx++) {
+    if (values[idx] > values[peakIdx]) peakIdx = idx;
+  }
+  const cx = peakIdx % nx, cy = (peakIdx / nx) | 0;
   const row = Array.from({ length: nx }, (_, i) => values[cy*nx+i]);
   const col = Array.from({ length: ny }, (_, j) => values[j*nx+cx]);
   const bwU = halfWidth(u,row,cx,true) != null && halfWidth(u,row,cx,false) != null
