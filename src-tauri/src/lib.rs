@@ -3,7 +3,7 @@
 
 use psf_core::{
     build_array, compute_psf, metrics as compute_metrics, weights_for, ArraySource, FocusConfig,
-    Metrics, Shading,
+    Metrics, Shading, SteeringFormulation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,10 @@ pub struct ComputeRequest {
     frequency: f64,
     speed_of_sound: f64,
     shading: Shading,
+    #[serde(default)]
+    steering: SteeringFormulation,
+    #[serde(default)]
+    diag_removal: bool,
 }
 
 #[derive(Serialize)]
@@ -40,6 +44,8 @@ fn compute(req: ComputeRequest) -> Result<ComputeResponse, String> {
         &req.focus,
         req.frequency,
         req.speed_of_sound,
+        req.steering,
+        req.diag_removal,
     )?;
     let metrics = compute_metrics(&array, &grid, &values, req.speed_of_sound);
     Ok(ComputeResponse {

@@ -1,0 +1,26 @@
+name: test
+
+# Fast feedback for the pure-compute crate (no webview/Tauri deps needed),
+# run on every push and PR so physics changes are checked without a full
+# installer build.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  psf-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./psf-core -> target"
+
+      - name: Run psf-core tests
+        run: cargo test --manifest-path psf-core/Cargo.toml --all-features

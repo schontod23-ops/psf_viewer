@@ -31,6 +31,8 @@ const state = {
   frequency: 5000,
   c: 343,
   shading: "uniform",
+  steering: "I",
+  diagRemoval: false,
   dyn: 30,
   levels: 10,
   lines: true,
@@ -161,6 +163,11 @@ $("raytrace").addEventListener("change", (e) => {
   geo.setRaytrace(state.raytrace);
 });
 
+$("diag-removal").addEventListener("change", (e) => {
+  state.diagRemoval = e.target.checked;
+  schedule();
+});
+
 $("lines").addEventListener("change", (e) => {
   state.lines = e.target.checked;
   if (lastResults.xy) drawPlot(lastResults[state.fplane] || lastResults.xy);
@@ -175,6 +182,7 @@ document.querySelectorAll(".seg").forEach((seg) => {
       btn.classList.add("on");
       state[key] = btn.dataset.val;
       if (key === "source") updateSourceVisibility();
+      if (key === "steering") $("lab-steering").textContent = `Formulation ${btn.dataset.val}`;
       schedule();
     });
   });
@@ -232,7 +240,15 @@ function buildRequest(planeName) {
     height: state.height,
     dx: state.dx,
   };
-  return { array, focus, frequency: state.frequency, speed_of_sound: state.c, shading: state.shading };
+  return {
+    array,
+    focus,
+    frequency: state.frequency,
+    speed_of_sound: state.c,
+    shading: state.shading,
+    steering: state.steering,
+    diag_removal: state.diagRemoval,
+  };
 }
 
 async function computePlane(planeName) {
@@ -413,28 +429,85 @@ function gridJS(focus) {
   return { nx, ny, u, v, corners, uh, vh };
 }
 
+// Sarradj (2012) steering-vector formulations — mirrors psf-core/src/lib.rs.
+// x_m(t) = (r0/rm) * exp(-jk(rm - r0)); reference r0 is the array centroid.
+//   I   (classic):       h_m = x_m / |x_m|                (phase only)
+//   II  (inverse):       h_m = 1 / conj(x_m)
+//   III (true level):    h_m = x_m / Σ w_m|x_m|²
+//   IV  (true location): h_m = x_m / sqrt(Σw_m * Σ w_m|x_m|²)
 function jsCompute(req) {
-  const arr     = buildArrayJS(req);
-  const weights = weightsForJS(arr, req.shading);
-  const f       = req.focus;
-  const g       = gridJS(f);
-  const k       = (2 * Math.PI * req.frequency) / req.speed_of_sound;
-  const d0      = arr.pos.map((m) => vdist(m, f.center));
-  const wsum    = weights.reduce((a,b) => a+b, 0) || 1;
-  const values  = new Float32Array(g.nx * g.ny);
+  const arr       = buildArrayJS(req);
+  const weights   = weightsForJS(arr, req.shading);
+  const f         = req.focus;
+  const g         = gridJS(f);
+  const k         = (2 * Math.PI * req.frequency) / req.speed_of_sound;
+  const reference = centroid(arr.pos);
+  const formulation = req.steering || "I";
+  const diagRemoval  = !!req.diag_removal;
+
+  // actual free-field pressure at each mic from the unit source
+  const p = arr.pos.map((m) => {
+    const d = Math.max(1e-9, vdist(m, f.center));
+    const ph = -k * d;
+    return [Math.cos(ph) / d, Math.sin(ph) / d];
+  });
+
+  const wsum = weights.reduce((a, b) => a + b, 0);
+  const wsumSafe = Math.abs(wsum) < 1e-30 ? 1 : wsum;
+  const needsNormPass = formulation === "III" || formulation === "IV";
+
+  const raw = new Float64Array(g.nx * g.ny);
   for (let j = 0; j < g.ny; j++) {
     for (let i = 0; i < g.nx; i++) {
       const pt = vadd(f.center, vadd(vscale(g.uh, g.u[i]), vscale(g.vh, g.v[j])));
-      let re = 0, im = 0;
-      for (let mi = 0; mi < arr.pos.length; mi++) {
-        const ph = k * (vdist(arr.pos[mi], pt) - d0[mi]);
-        re += weights[mi] * Math.cos(ph);
-        im += weights[mi] * Math.sin(ph);
+      const r0 = Math.max(1e-9, vdist(reference, pt));
+
+      let normSqSum = 1;
+      if (needsNormPass) {
+        let s = 0;
+        for (let mi = 0; mi < arr.pos.length; mi++) {
+          const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
+          const gm = r0 / rm;
+          s += weights[mi] * gm * gm;
+        }
+        normSqSum = Math.abs(s) < 1e-30 ? 1 : s;
       }
-      const p = (re*re + im*im) / (wsum*wsum) + 1e-30;
-      values[j*g.nx+i] = Math.max(-300, 10*Math.log10(p));
+      let norm;
+      if (formulation === "III") norm = normSqSum;
+      else if (formulation === "IV") norm = Math.sqrt(Math.max(0, wsumSafe) * normSqSum);
+      else norm = wsumSafe;
+      const invNorm = Math.abs(norm) < 1e-30 ? 1 : 1 / norm;
+
+      let sRe = 0, sIm = 0, diagSum = 0;
+      for (let mi = 0; mi < arr.pos.length; mi++) {
+        const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
+        const gm = r0 / rm;
+        const ph = -k * (rm - r0);
+        const c = Math.cos(ph), s = Math.sin(ph);
+        let yRe, yIm;
+        if (formulation === "II") { yRe = c / gm; yIm = s / gm; }
+        else if (formulation === "III" || formulation === "IV") { yRe = gm * c; yIm = gm * s; }
+        else { yRe = c; yIm = s; }
+        const hRe = weights[mi] * yRe * invNorm;
+        const hIm = weights[mi] * yIm * invNorm;
+        const [pRe, pIm] = p[mi];
+        sRe += hRe * pRe + hIm * pIm;
+        sIm += hRe * pIm - hIm * pRe;
+        if (diagRemoval) diagSum += (hRe * hRe + hIm * hIm) * (pRe * pRe + pIm * pIm);
+      }
+      let power = sRe * sRe + sIm * sIm;
+      if (diagRemoval) power -= diagSum;
+      raw[j * g.nx + i] = Math.max(0, power);
     }
   }
+
+  const cx = g.nx >> 1, cy = g.ny >> 1;
+  const p0 = Math.max(1e-30, raw[cy * g.nx + cx]);
+  const values = new Float32Array(g.nx * g.ny);
+  for (let idx = 0; idx < raw.length; idx++) {
+    values[idx] = Math.max(-300, 10 * Math.log10(raw[idx] / p0 + 1e-30));
+  }
+
   const metrics = metricsJS(arr, g, values, req.speed_of_sound);
   return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, metrics };
 }

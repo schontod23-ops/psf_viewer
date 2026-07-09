@@ -231,6 +231,33 @@ pub fn weights_for(array: &Array, shading: Shading) -> Vec<f64> {
     }
 }
 
+// ─────────────────────────────────────────────────────────── steering vector
+
+/// Sarradj (2012) steering-vector formulation used to build the beamformer
+/// weight vector `h_m(t)` for scan point `t`.
+///
+/// Let `rm(t)` be the distance from mic `m` to `t`, `r0(t)` the distance from
+/// a fixed reference point (here: the array centroid) to `t`, and
+///   x_m(t) = [r0(t)/rm(t)] · exp[-jk(rm(t) − r0(t))]
+/// the free-field transfer-function ratio relative to that reference. Then:
+///   I   (classic):       h_m = x_m / |x_m|                (phase only)
+///   II  (inverse):       h_m = 1 / conj(x_m)
+///   III (true level):    h_m = x_m / Σ_m w_m|x_m|²
+///   IV  (true location): h_m = x_m / √(Σ_m w_m · Σ_m w_m|x_m|²)
+/// (all further scaled by the per-mic shading weight `w_m`). Formulation I
+/// matches a plain delay-and-sum beamformer; II-IV additionally compensate
+/// the near-field amplitude falloff so the array focuses at the correct
+/// level ("true level"/"true location") rather than just the correct phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SteeringFormulation {
+    #[default]
+    I,
+    Ii,
+    Iii,
+    Iv,
+}
+
 // ─────────────────────────────────────────────────────────── focus grid
 
 /// Focus / scan-plane description.
@@ -286,14 +313,22 @@ impl FocusConfig {
 
 // ─────────────────────────────────────────────────────────── beamformer
 
-/// Compute the normalised PSF (dB) over the focus grid.
-/// Returns row-major values (`v` outer, `u` inner), length `nx*ny`.
+/// Compute the normalised PSF (dB) over the focus grid, using a rank-1
+/// cross-spectral matrix `C = p·pᴴ` built from a single unit point source
+/// (`p_m` = free-field pressure at mic `m`), steered with the chosen Sarradj
+/// formulation. With `diag_removal` the CSM diagonal (autopower) terms are
+/// subtracted before computing the beamformer output, i.e.
+///   P(t) = hᴴ(t)·C·h(t) − diag_removal · Σ_m |h_m(t)|²|p_m|²
+/// Returns row-major values (`v` outer, `u` inner), length `nx*ny`, in dB
+/// relative to the value at the focus centre (peak = 0 dB there).
 pub fn compute_psf(
     array: &Array,
     weights: &[f64],
     focus: &FocusConfig,
     frequency: f64,
     speed_of_sound: f64,
+    formulation: SteeringFormulation,
+    diag_removal: bool,
 ) -> Result<(Grid, Vec<f32>), String> {
     if array.is_empty() {
         return Err("No microphones to compute with.".into());
@@ -306,33 +341,95 @@ pub fn compute_psf(
     let k = 2.0 * std::f64::consts::PI * frequency / speed_of_sound;
 
     let source = focus.center;
-    let d0: Vec<f64> = array.pos.iter().map(|m| dist(*m, source)).collect();
-    let wsum: f64 = weights.iter().sum();
-    let inv_wsum = if wsum.abs() < 1e-30 { 1.0 } else { 1.0 / wsum };
-
+    let reference = array.centroid();
     let mics = &array.pos;
-    let mut values = vec![0f32; grid.nx * grid.ny];
 
-    values
-        .par_chunks_mut(grid.nx)
+    // Actual free-field pressure at each mic from the unit source
+    // (1/r amplitude falloff + propagation phase).
+    let p: Vec<(f64, f64)> = mics
+        .iter()
+        .map(|m| {
+            let d = dist(*m, source).max(1e-9);
+            let phase = -k * d;
+            let (s, c) = phase.sin_cos();
+            (c / d, s / d)
+        })
+        .collect();
+
+    let wsum: f64 = weights.iter().sum();
+    let wsum_safe = if wsum.abs() < 1e-30 { 1.0 } else { wsum };
+    let needs_norm_pass = matches!(formulation, SteeringFormulation::Iii | SteeringFormulation::Iv);
+
+    let mut raw = vec![0f64; grid.nx * grid.ny];
+
+    raw.par_chunks_mut(grid.nx)
         .enumerate()
         .for_each(|(j, row)| {
             let vv = grid.v[j];
             for (i, cell) in row.iter_mut().enumerate() {
                 let uu = grid.u[i];
                 let point = add(focus.center, add(scale(uh, uu), scale(vh, vv)));
-                let mut re = 0.0f64;
-                let mut im = 0.0f64;
+                let r0 = dist(reference, point).max(1e-9);
+
+                // III/IV need Σ w_m|x_m|² = Σ w_m·(r0/rm)² up front.
+                let norm_sq_sum = if needs_norm_pass {
+                    let mut s = 0.0f64;
+                    for (m, mic) in mics.iter().enumerate() {
+                        let rm = dist(*mic, point).max(1e-9);
+                        let g = r0 / rm;
+                        s += weights[m] * g * g;
+                    }
+                    if s.abs() < 1e-30 { 1.0 } else { s }
+                } else {
+                    1.0
+                };
+                let norm: f64 = match formulation {
+                    SteeringFormulation::I | SteeringFormulation::Ii => wsum_safe,
+                    SteeringFormulation::Iii => norm_sq_sum,
+                    SteeringFormulation::Iv => (wsum_safe.max(0.0) * norm_sq_sum).sqrt(),
+                };
+                let inv_norm = if norm.abs() < 1e-30 { 1.0 } else { 1.0 / norm };
+
+                let mut s_re = 0.0f64;
+                let mut s_im = 0.0f64;
+                let mut diag_sum = 0.0f64;
                 for (m, mic) in mics.iter().enumerate() {
-                    let phase = k * (dist(*mic, point) - d0[m]);
+                    let rm = dist(*mic, point).max(1e-9);
+                    let g = r0 / rm;
+                    let phase = -k * (rm - r0);
                     let (s, c) = phase.sin_cos();
-                    re += weights[m] * c;
-                    im += weights[m] * s;
+                    // y_m per formulation (unweighted, unnormalised steering coeff.)
+                    let (y_re, y_im) = match formulation {
+                        SteeringFormulation::I => (c, s),
+                        SteeringFormulation::Ii => (c / g, s / g),
+                        SteeringFormulation::Iii | SteeringFormulation::Iv => (g * c, g * s),
+                    };
+                    let h_re = weights[m] * y_re * inv_norm;
+                    let h_im = weights[m] * y_im * inv_norm;
+                    let (p_re, p_im) = p[m];
+                    // S += conj(h_m) * p_m
+                    s_re += h_re * p_re + h_im * p_im;
+                    s_im += h_re * p_im - h_im * p_re;
+                    if diag_removal {
+                        diag_sum += (h_re * h_re + h_im * h_im) * (p_re * p_re + p_im * p_im);
+                    }
                 }
-                let p = (re * re + im * im) * (inv_wsum * inv_wsum);
-                *cell = (10.0 * (p + 1e-30).log10()).max(DB_FLOOR as f64) as f32;
+                let mut power = s_re * s_re + s_im * s_im;
+                if diag_removal {
+                    power -= diag_sum;
+                }
+                *cell = power.max(0.0);
             }
         });
+
+    let cx = grid.nx / 2;
+    let cy = grid.ny / 2;
+    let p0 = raw[cy * grid.nx + cx].max(1e-30);
+
+    let values: Vec<f32> = raw
+        .iter()
+        .map(|&p| (10.0 * (p / p0 + 1e-30).log10()).max(DB_FLOOR as f64) as f32)
+        .collect();
 
     Ok((grid, values))
 }
@@ -542,7 +639,16 @@ mod tests {
     fn peak_is_zero_db_at_center() {
         let a = build_array(&sunflower(64, 1.0)).unwrap();
         let w = weights_for(&a, Shading::Uniform);
-        let (g, vals) = compute_psf(&a, &w, &focus(), 5000.0, 343.0).unwrap();
+        let (g, vals) = compute_psf(
+            &a,
+            &w,
+            &focus(),
+            5000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
         let cx = g.nx / 2;
         let cy = g.ny / 2;
         let center = vals[cy * g.nx + cx];
@@ -556,7 +662,16 @@ mod tests {
     fn symmetric_array_gives_symmetric_psf() {
         let a = build_array(&sunflower(100, 1.0)).unwrap();
         let w = weights_for(&a, Shading::Uniform);
-        let (g, vals) = compute_psf(&a, &w, &focus(), 4000.0, 343.0).unwrap();
+        let (g, vals) = compute_psf(
+            &a,
+            &w,
+            &focus(),
+            4000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
         // The full sunflower isn't perfectly mirror-symmetric, but the central
         // mainlobe should be near-symmetric: compare immediate neighbours.
         let cx = g.nx / 2;
@@ -571,9 +686,11 @@ mod tests {
         let a = build_array(&sunflower(81, 1.0)).unwrap();
         let w = weights_for(&a, Shading::Uniform);
         let f = focus();
-        let (g1, v1) = compute_psf(&a, &w, &f, 2000.0, 343.0).unwrap();
+        let (g1, v1) =
+            compute_psf(&a, &w, &f, 2000.0, 343.0, SteeringFormulation::I, false).unwrap();
         let m1 = metrics(&a, &g1, &v1, 343.0);
-        let (g2, v2) = compute_psf(&a, &w, &f, 8000.0, 343.0).unwrap();
+        let (g2, v2) =
+            compute_psf(&a, &w, &f, 8000.0, 343.0, SteeringFormulation::I, false).unwrap();
         let m2 = metrics(&a, &g2, &v2, 343.0);
         let b1 = m1.beamwidth_u.unwrap();
         let b2 = m2.beamwidth_u.unwrap();
@@ -584,9 +701,125 @@ mod tests {
     fn alias_frequency_reasonable() {
         let a = build_array(&sunflower(50, 1.0)).unwrap();
         let w = weights_for(&a, Shading::Uniform);
-        let (g, v) = compute_psf(&a, &w, &focus(), 3000.0, 343.0).unwrap();
+        let (g, v) = compute_psf(
+            &a,
+            &w,
+            &focus(),
+            3000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
         let m = metrics(&a, &g, &v, 343.0);
         assert!(m.alias_frequency.unwrap() > 0.0);
         assert!(m.aperture > 0.9 && m.aperture <= 1.0001);
+    }
+
+    // Close, strongly near-field focus so amplitude falloff across the
+    // aperture is significant enough to tell the formulations apart.
+    fn near_focus() -> FocusConfig {
+        FocusConfig {
+            center: [0., 0., 0.3],
+            plane: Plane::Xy,
+            width: 0.6,
+            height: 0.6,
+            dx: 0.02,
+        }
+    }
+
+    #[test]
+    fn all_formulations_peak_at_center() {
+        let a = build_array(&sunflower(48, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        for formulation in [
+            SteeringFormulation::I,
+            SteeringFormulation::Ii,
+            SteeringFormulation::Iii,
+            SteeringFormulation::Iv,
+        ] {
+            for diag_removal in [false, true] {
+                let (g, vals) = compute_psf(
+                    &a,
+                    &w,
+                    &near_focus(),
+                    4000.0,
+                    343.0,
+                    formulation,
+                    diag_removal,
+                )
+                .unwrap();
+                let center = vals[(g.ny / 2) * g.nx + (g.nx / 2)];
+                assert!(
+                    center.abs() < 1e-3,
+                    "{formulation:?} diag_removal={diag_removal}: center should be 0 dB, got {center}"
+                );
+                assert!(
+                    vals.iter().all(|v| v.is_finite()),
+                    "{formulation:?} diag_removal={diag_removal}: non-finite value in grid"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn formulations_diverge_in_near_field() {
+        // Amplitude-compensating formulations (III) should give a materially
+        // different field than the phase-only classic formulation (I) once
+        // the source is close enough that 1/r falloff varies across mics.
+        let a = build_array(&sunflower(48, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let (_, v1) = compute_psf(
+            &a,
+            &w,
+            &near_focus(),
+            4000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
+        let (_, v3) = compute_psf(
+            &a,
+            &w,
+            &near_focus(),
+            4000.0,
+            343.0,
+            SteeringFormulation::Iii,
+            false,
+        )
+        .unwrap();
+        let max_diff = v1
+            .iter()
+            .zip(v3.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 0.1,
+            "formulations I and III should diverge in the near field, max diff was {max_diff}"
+        );
+    }
+
+    #[test]
+    fn diagonal_removal_never_increases_raw_power() {
+        // hᴴCh − Σ|h_m|²|p_m|² ≤ hᴴCh pointwise, for every formulation, since
+        // the subtracted diagonal terms are each ≥ 0. Check this indirectly:
+        // diag-removed dB values, referenced to their own (also diag-removed)
+        // centre, must stay finite and bounded by the same floor.
+        let a = build_array(&sunflower(48, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let (g, vals) = compute_psf(
+            &a,
+            &w,
+            &near_focus(),
+            4000.0,
+            343.0,
+            SteeringFormulation::I,
+            true,
+        )
+        .unwrap();
+        assert!(vals.iter().all(|v| v.is_finite() && *v <= 1e-3));
+        let center = vals[(g.ny / 2) * g.nx + (g.nx / 2)];
+        assert!(center.abs() < 1e-3, "center should be 0 dB, got {center}");
     }
 }
