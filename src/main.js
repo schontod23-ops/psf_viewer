@@ -19,6 +19,16 @@ const state = {
   source: "sunflower",
   n: 64,
   diameter: 0.5,
+  // ring
+  ringN: 16,
+  ringDiameter: 0.5,
+  // grid
+  gridNx: 8,
+  gridNy: 8,
+  gridPitch: 0.05,
+  // cross
+  crossN: 9,
+  crossLength: 0.5,
   aplane: "xy",
   acenter: [0, 0, 0],
   csvText: null,
@@ -82,6 +92,11 @@ function bindSlider(id, key, fmt) {
 }
 bindSlider("n", "n", (v) => `${v | 0}`);
 bindSlider("diameter", "diameter", (v) => `${v.toFixed(2)} m`);
+bindSlider("ring-n", "ringN", (v) => `${v | 0}`);
+bindSlider("ring-diameter", "ringDiameter", (v) => `${v.toFixed(2)} m`);
+bindSlider("grid-pitch", "gridPitch", (v) => `${v.toFixed(3)} m`);
+bindSlider("cross-n", "crossN", (v) => `${v | 0}`);
+bindSlider("cross-length", "crossLength", (v) => `${v.toFixed(2)} m`);
 bindSlider("dx", "dx", (v) => `${v.toFixed(3)} m`);
 bindSlider("frequency", "frequency", (v) => `${v | 0} Hz`);
 bindSlider("dyn", "dyn", (v) => `${v | 0} dB`);
@@ -190,6 +205,8 @@ function bindNumber(id, setter) {
 bindNumber("acx", (v) => (state.acenter[0] = v || 0));
 bindNumber("acy", (v) => (state.acenter[1] = v || 0));
 bindNumber("acz", (v) => (state.acenter[2] = v || 0));
+bindNumber("grid-nx", (v) => (state.gridNx = Math.max(1, Math.round(v) || 1)));
+bindNumber("grid-ny", (v) => (state.gridNy = Math.max(1, Math.round(v) || 1)));
 
 // Focus center — also drives srcPos when srcAtFocus is on
 function bindFocusCenter(id, axis) {
@@ -288,6 +305,10 @@ function updateSourceVisibility() {
     const [k, v] = el.dataset.when.split("=");
     el.hidden = state[k] !== v;
   });
+  document.querySelectorAll("[data-when-not]").forEach((el) => {
+    const [k, v] = el.dataset.whenNot.split("=");
+    el.hidden = state[k] === v;
+  });
 }
 updateSourceVisibility();
 
@@ -317,12 +338,27 @@ function schedule() {
   timer = setTimeout(compute, 140);
 }
 
+function buildArrayDescriptor() {
+  const center = state.acenter.slice();
+  const plane = state.aplane;
+  switch (state.source) {
+    case "ring":
+      return { kind: "ring", n: state.ringN, diameter: state.ringDiameter, center, plane };
+    case "grid":
+      return { kind: "grid", nx: state.gridNx, ny: state.gridNy, pitch: state.gridPitch, center, plane };
+    case "cross":
+      return { kind: "cross", n: state.crossN, length: state.crossLength, center, plane };
+    case "csv":
+      return { kind: "csv", text: state.csvText || "" };
+    case "sunflower":
+    default:
+      return { kind: "sunflower", n: state.n, diameter: state.diameter, center, plane };
+  }
+}
+
 function buildRequest(planeName) {
   const plane = planeName || state.fplane;
-  const array =
-    state.source === "sunflower"
-      ? { kind: "sunflower", n: state.n, diameter: state.diameter, center: state.acenter.slice(), plane: state.aplane }
-      : { kind: "csv", text: state.csvText || "" };
+  const array = buildArrayDescriptor();
 
   // Choose a sensible default center for off-axis planes:
   // the user's focus center, but mapped into the correct axes
@@ -483,6 +519,40 @@ function buildArrayJS(req) {
       const r  = r0 * Math.sqrt((k + 0.5) / a.n);
       const th = k * GOLDEN;
       pos.push(vadd(a.center, vadd(vscale(uh, r*Math.cos(th)), vscale(vh, r*Math.sin(th)))));
+    }
+    return { pos, weights: null };
+  }
+  if (a.kind === "ring") {
+    const [uh, vh] = planeBasis(a.plane);
+    const r = a.diameter / 2;
+    const pos = [];
+    for (let k = 0; k < a.n; k++) {
+      const th = (k / a.n) * 2 * Math.PI;
+      pos.push(vadd(a.center, vadd(vscale(uh, r*Math.cos(th)), vscale(vh, r*Math.sin(th)))));
+    }
+    return { pos, weights: null };
+  }
+  if (a.kind === "grid") {
+    const [uh, vh] = planeBasis(a.plane);
+    const u0 = -(a.nx - 1) * a.pitch / 2;
+    const v0 = -(a.ny - 1) * a.pitch / 2;
+    const pos = [];
+    for (let j = 0; j < a.ny; j++)
+      for (let i = 0; i < a.nx; i++) {
+        const uu = u0 + i * a.pitch, vv = v0 + j * a.pitch;
+        pos.push(vadd(a.center, vadd(vscale(uh, uu), vscale(vh, vv))));
+      }
+    return { pos, weights: null };
+  }
+  if (a.kind === "cross") {
+    const [uh, vh] = planeBasis(a.plane);
+    const half = a.length / 2, step = a.length / (a.n - 1);
+    const pos = [];
+    for (let i = 0; i < a.n; i++) pos.push(vadd(a.center, vscale(uh, -half + i*step)));
+    for (let j = 0; j < a.n; j++) {
+      const vv = -half + j*step;
+      if (Math.abs(vv) < 1e-12) continue;
+      pos.push(vadd(a.center, vscale(vh, vv)));
     }
     return { pos, weights: null };
   }

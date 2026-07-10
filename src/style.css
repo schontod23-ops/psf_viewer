@@ -252,6 +252,8 @@ input[type="number"]:focus, .file-btn:focus-visible {
   border-radius: var(--radius-sm);
 }
 .seg.sm { width: 100%; }
+.seg.wrap { flex-wrap: wrap; }
+.seg.wrap button { flex: 1 0 26%; }
 .seg button {
   flex: 1; cursor: pointer;
   background: transparent; border: none; color: var(--ink-dim);

@@ -33,11 +33,15 @@
         <section class="group">
           <div class="eyebrow">Array</div>
 
-          <div class="seg" data-seg="source">
+          <div class="seg wrap" data-seg="source">
             <button data-val="sunflower" class="on">Sunflower</button>
-            <button data-val="csv">CSV file</button>
+            <button data-val="ring">Ring</button>
+            <button data-val="grid">Grid</button>
+            <button data-val="cross">Cross</button>
+            <button data-val="csv">CSV</button>
           </div>
 
+          <!-- Sunflower / Ring share microphone-count + diameter -->
           <div data-when="source=sunflower">
             <label class="field">
               <span>Microphones <em id="lab-n">64</em></span>
@@ -53,6 +57,58 @@
                 <input type="number" id="diameter-num" class="slider-num" min="0.05" max="3" step="0.01" value="0.5" aria-label="diameter (m)" />
               </div>
             </label>
+          </div>
+
+          <div data-when="source=ring" hidden>
+            <label class="field">
+              <span>Microphones <em id="lab-ring-n">16</em></span>
+              <div class="slider-num-row">
+                <input type="range" id="ring-n" min="3" max="128" step="1" value="16" />
+                <input type="number" id="ring-n-num" class="slider-num" min="3" max="128" step="1" value="16" aria-label="ring microphone count" />
+              </div>
+            </label>
+            <label class="field">
+              <span>Diameter <em id="lab-ring-d">0.50 m</em></span>
+              <div class="slider-num-row">
+                <input type="range" id="ring-diameter" min="0.05" max="3" step="0.01" value="0.5" />
+                <input type="number" id="ring-diameter-num" class="slider-num" min="0.05" max="3" step="0.01" value="0.5" aria-label="ring diameter (m)" />
+              </div>
+            </label>
+          </div>
+
+          <div data-when="source=grid" hidden>
+            <div class="field grid2">
+              <label><span>Columns (nx)</span><input type="number" id="grid-nx" value="8" min="1" max="64" step="1" /></label>
+              <label><span>Rows (ny)</span><input type="number" id="grid-ny" value="8" min="1" max="64" step="1" /></label>
+            </div>
+            <label class="field">
+              <span>Pitch <em id="lab-grid-pitch">0.050 m</em></span>
+              <div class="slider-num-row">
+                <input type="range" id="grid-pitch" min="0.005" max="0.5" step="0.005" value="0.05" />
+                <input type="number" id="grid-pitch-num" class="slider-num" min="0.005" max="0.5" step="0.005" value="0.05" aria-label="grid pitch (m)" />
+              </div>
+            </label>
+          </div>
+
+          <div data-when="source=cross" hidden>
+            <label class="field">
+              <span>Mics per arm <em id="lab-cross-n">9</em></span>
+              <div class="slider-num-row">
+                <input type="range" id="cross-n" min="2" max="64" step="1" value="9" />
+                <input type="number" id="cross-n-num" class="slider-num" min="2" max="64" step="1" value="9" aria-label="cross mics per arm" />
+              </div>
+            </label>
+            <label class="field">
+              <span>Length <em id="lab-cross-length">0.50 m</em></span>
+              <div class="slider-num-row">
+                <input type="range" id="cross-length" min="0.05" max="3" step="0.01" value="0.5" />
+                <input type="number" id="cross-length-num" class="slider-num" min="0.05" max="3" step="0.01" value="0.5" aria-label="cross length (m)" />
+              </div>
+            </label>
+          </div>
+
+          <!-- Plane + centre shared by all generated (non-CSV) arrays -->
+          <div data-when-not="source=csv">
             <div class="field">
               <span>Array plane</span>
               <div class="seg sm" data-seg="aplane">

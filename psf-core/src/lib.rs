@@ -81,6 +81,29 @@ pub enum ArraySource {
         center: [f64; 3],
         plane: Plane,
     },
+    /// Uniform circular array — `n` mics equally spaced on one ring.
+    Ring {
+        n: usize,
+        diameter: f64,
+        center: [f64; 3],
+        plane: Plane,
+    },
+    /// Uniform rectangular grid, `nx` × `ny` mics on a regular pitch.
+    Grid {
+        nx: usize,
+        ny: usize,
+        pitch: f64,
+        center: [f64; 3],
+        plane: Plane,
+    },
+    /// Two orthogonal lines forming a cross (`n` mics per full arm),
+    /// spanning `length` tip-to-tip along each axis.
+    Cross {
+        n: usize,
+        length: f64,
+        center: [f64; 3],
+        plane: Plane,
+    },
     /// Positions parsed from CSV text (3 columns x,y,z; optional 4th = weight).
     Csv { text: String },
 }
@@ -139,6 +162,97 @@ pub fn build_array(src: &ArraySource) -> Result<Array, String> {
                     add(*center, add(scale(uh, r * c), scale(vh, r * s)))
                 })
                 .collect();
+            Ok(Array {
+                pos,
+                csv_weights: None,
+            })
+        }
+        ArraySource::Ring {
+            n,
+            diameter,
+            center,
+            plane,
+        } => {
+            if *n == 0 {
+                return Err("Array needs at least one microphone.".into());
+            }
+            if !diameter.is_finite() || *diameter <= 0.0 {
+                return Err("Array diameter must be a positive number.".into());
+            }
+            let (uh, vh, _) = plane.basis();
+            let r = diameter / 2.0;
+            let nn = *n as f64;
+            let pos = (0..*n)
+                .map(|k| {
+                    let theta = (k as f64) / nn * std::f64::consts::TAU;
+                    let (s, c) = theta.sin_cos();
+                    add(*center, add(scale(uh, r * c), scale(vh, r * s)))
+                })
+                .collect();
+            Ok(Array {
+                pos,
+                csv_weights: None,
+            })
+        }
+        ArraySource::Grid {
+            nx,
+            ny,
+            pitch,
+            center,
+            plane,
+        } => {
+            if *nx == 0 || *ny == 0 {
+                return Err("Grid needs at least one microphone per side.".into());
+            }
+            if !pitch.is_finite() || *pitch <= 0.0 {
+                return Err("Grid pitch must be a positive number.".into());
+            }
+            let (uh, vh, _) = plane.basis();
+            // Centre the grid on `center`.
+            let u0 = -(*nx as f64 - 1.0) * pitch / 2.0;
+            let v0 = -(*ny as f64 - 1.0) * pitch / 2.0;
+            let mut pos = Vec::with_capacity(nx * ny);
+            for j in 0..*ny {
+                for i in 0..*nx {
+                    let uu = u0 + i as f64 * pitch;
+                    let vv = v0 + j as f64 * pitch;
+                    pos.push(add(*center, add(scale(uh, uu), scale(vh, vv))));
+                }
+            }
+            Ok(Array {
+                pos,
+                csv_weights: None,
+            })
+        }
+        ArraySource::Cross {
+            n,
+            length,
+            center,
+            plane,
+        } => {
+            if *n < 2 {
+                return Err("Cross needs at least two microphones per arm.".into());
+            }
+            if !length.is_finite() || *length <= 0.0 {
+                return Err("Cross length must be a positive number.".into());
+            }
+            let (uh, vh, _) = plane.basis();
+            let half = length / 2.0;
+            let step = length / (*n as f64 - 1.0);
+            let mut pos = Vec::with_capacity(2 * *n - 1);
+            // Horizontal arm.
+            for i in 0..*n {
+                let uu = -half + i as f64 * step;
+                pos.push(add(*center, scale(uh, uu)));
+            }
+            // Vertical arm — skip the shared centre mic to avoid a duplicate.
+            for j in 0..*n {
+                let vv = -half + j as f64 * step;
+                if vv.abs() < 1e-12 {
+                    continue;
+                }
+                pos.push(add(*center, scale(vh, vv)));
+            }
             Ok(Array {
                 pos,
                 csv_weights: None,
@@ -604,6 +718,60 @@ mod tests {
             diameter: d,
             center: [0., 0., 0.],
             plane: Plane::Xy,
+        }
+    }
+
+    #[test]
+    fn ring_count_and_radius() {
+        let a = build_array(&ArraySource::Ring {
+            n: 16,
+            diameter: 1.0,
+            center: [0., 0., 0.],
+            plane: Plane::Xy,
+        })
+        .unwrap();
+        assert_eq!(a.len(), 16);
+        for p in &a.pos {
+            let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            assert!((r - 0.5).abs() < 1e-9, "ring mic off radius: {r}");
+            assert!(p[2].abs() < 1e-12, "xy array must have z=0");
+        }
+    }
+
+    #[test]
+    fn grid_count_and_extent() {
+        let a = build_array(&ArraySource::Grid {
+            nx: 4,
+            ny: 3,
+            pitch: 0.1,
+            center: [0., 0., 0.],
+            plane: Plane::Xy,
+        })
+        .unwrap();
+        assert_eq!(a.len(), 12);
+        // Centred: x spans ±0.15, y spans ±0.10.
+        let xmax = a.pos.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
+        let ymax = a.pos.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
+        assert!((xmax - 0.15).abs() < 1e-9, "grid x extent: {xmax}");
+        assert!((ymax - 0.10).abs() < 1e-9, "grid y extent: {ymax}");
+    }
+
+    #[test]
+    fn cross_count_no_duplicate_centre() {
+        let a = build_array(&ArraySource::Cross {
+            n: 5,
+            length: 1.0,
+            center: [0., 0., 0.],
+            plane: Plane::Xy,
+        })
+        .unwrap();
+        // 5 per arm, sharing one centre mic → 2·5 − 1 = 9.
+        assert_eq!(a.len(), 9);
+        // No two mics coincide.
+        for i in 0..a.len() {
+            for j in (i + 1)..a.len() {
+                assert!(dist(a.pos[i], a.pos[j]) > 1e-9, "duplicate mic at {i},{j}");
+            }
         }
     }
 
