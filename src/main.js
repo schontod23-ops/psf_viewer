@@ -63,6 +63,10 @@ const $ = (id) => document.getElementById(id);
 
 // ───────────────────────── control wiring ─────────────────────────
 
+// Registry of silent slider setters (state → DOM) keyed by slider id,
+// used when applying a loaded configuration without re-triggering compute.
+const sliderSetters = {};
+
 // Slider with paired number input
 function bindSlider(id, key, fmt) {
   const slider = $(id);
@@ -75,6 +79,7 @@ function bindSlider(id, key, fmt) {
     if (slider.value != val) slider.value = val;
     if (num && num.value != val) num.value = val;
   }
+  sliderSetters[id] = sync;
 
   slider.addEventListener("input", () => { sync(parseFloat(slider.value)); schedule(); });
 
@@ -521,6 +526,104 @@ function planeAxesLabels(label) {
 
 $("export-png").addEventListener("click", exportPng);
 $("export-csv").addEventListener("click", exportCsv);
+
+// ───────────────────────── save / load configuration ─────────────────────────
+function currentConfig() {
+  return { app: "psf-array-viewer", version: 1, state: JSON.parse(JSON.stringify(state)) };
+}
+
+function saveConfig() {
+  const blob = new Blob([JSON.stringify(currentConfig(), null, 2)], { type: "application/json" });
+  downloadBlob(blob, `psf-config-${timestamp()}.json`);
+}
+
+// Push the whole `state` object back into every control (no per-control
+// event dispatch — we recompute once at the end).
+function setSeg(key, val) {
+  const seg = document.querySelector(`.seg[data-seg="${key}"]`);
+  if (!seg) return;
+  seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.val === val));
+}
+
+function syncAllControls() {
+  const sliderMap = {
+    n: "n", diameter: "diameter", "ring-n": "ringN", "ring-diameter": "ringDiameter",
+    "grid-pitch": "gridPitch", "cross-n": "crossN", "cross-length": "crossLength",
+    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels",
+  };
+  for (const id in sliderMap) {
+    const setter = sliderSetters[id];
+    if (setter) setter(state[sliderMap[id]]);
+  }
+  $("grid-nx").value = state.gridNx;
+  $("grid-ny").value = state.gridNy;
+  $("acx").value = state.acenter[0];
+  $("acy").value = state.acenter[1];
+  $("acz").value = state.acenter[2];
+  $("fcx").value = state.fcenter[0];
+  $("fcy").value = state.fcenter[1];
+  $("fcz").value = state.fcenter[2];
+  $("width").value = state.width;
+  $("height").value = state.height;
+  $("c").value = state.c;
+  syncSrcInputs();
+
+  setSeg("source", state.source);
+  setSeg("aplane", state.aplane);
+  setSeg("fplane", state.fplane);
+  setSeg("shading", state.shading);
+  setSeg("steering", state.steering);
+  $("lab-steering").textContent = `Formulation ${state.steering}`;
+
+  $("src-at-focus").checked = state.srcAtFocus;
+  $("src-pos-fields").style.opacity = state.srcAtFocus ? "0.45" : "1";
+  $("src-pos-fields").style.pointerEvents = state.srcAtFocus ? "none" : "";
+  $("multiplane").checked = state.multiplane;
+  $("raytrace").checked = state.raytrace;
+  $("rt-badge").hidden = !state.raytrace;
+  $("diag-removal").checked = state.diagRemoval;
+  $("lines").checked = state.lines;
+  if (state.csvName) $("csv-status").textContent = `Loaded ${state.csvName}`;
+
+  updateSourceVisibility();
+  geo.setMultiplane(state.multiplane);
+  geo.setRaytrace(state.raytrace);
+  geo.updateSource(state.srcPos);
+}
+
+function applyConfig(cfg) {
+  const s = cfg && cfg.state;
+  if (!s || typeof s !== "object") {
+    toast("Not a valid PSF Array Viewer config file.");
+    return;
+  }
+  Object.assign(state, s);
+  // Ensure the 3-vectors are real arrays (in case of a partial file).
+  state.acenter = Array.isArray(s.acenter) ? s.acenter.slice() : state.acenter;
+  state.fcenter = Array.isArray(s.fcenter) ? s.fcenter.slice() : state.fcenter;
+  state.srcPos = Array.isArray(s.srcPos) ? s.srcPos.slice() : state.srcPos;
+  syncAllControls();
+  compute();
+  toast("Configuration loaded.");
+}
+
+$("config-save").addEventListener("click", saveConfig);
+$("config-load").addEventListener("click", () => $("config-input").click());
+$("config-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      applyConfig(JSON.parse(String(reader.result)));
+    } catch {
+      toast("Could not parse that config file.");
+    }
+  };
+  reader.onerror = () => toast("Could not read that file.");
+  reader.readAsText(file);
+  e.target.value = ""; // allow re-loading the same file
+});
 
 // ───────────────────────── readouts ─────────────────────────
 const fmtFreq = (hz) => (hz >= 1000 ? `${(hz / 1000).toFixed(2)} kHz` : `${hz | 0} Hz`);
