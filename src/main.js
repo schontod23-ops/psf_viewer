@@ -459,6 +459,69 @@ function renderOffscreenTexture(res, plane) {
   geo.setTexture(cv, plane);
 }
 
+// ───────────────────────── export ─────────────────────────
+function timestamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportPng() {
+  const canvas = plot.canvas;
+  if (!canvas || !canvas.width) {
+    toast("Nothing to export yet.");
+    return;
+  }
+  canvas.toBlob((blob) => {
+    if (!blob) {
+      toast("PNG export failed.");
+      return;
+    }
+    downloadBlob(blob, `psf-${state.fplane}-${state.frequency | 0}Hz-${timestamp()}.png`);
+  }, "image/png");
+}
+
+function exportCsv() {
+  const res = lastResults[state.fplane];
+  if (!res) {
+    toast("Nothing to export yet.");
+    return;
+  }
+  const [au, av] = planeAxesLabels(state.fplane);
+  const lines = [];
+  lines.push(`# PSF Array Viewer export`);
+  lines.push(`# plane=${state.fplane} frequency_Hz=${state.frequency} speed_of_sound_m_s=${state.c}`);
+  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval}`);
+  lines.push(`# source_m=[${state.srcPos.join(",")}] grid=${res.nx}x${res.ny}`);
+  lines.push(`${au}_m,${av}_m,level_dB`);
+  for (let j = 0; j < res.ny; j++) {
+    for (let i = 0; i < res.nx; i++) {
+      lines.push(`${res.u[i]},${res.v[j]},${res.values[j * res.nx + i]}`);
+    }
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  downloadBlob(blob, `psf-${state.fplane}-${state.frequency | 0}Hz-${timestamp()}.csv`);
+}
+
+function planeAxesLabels(label) {
+  if (label === "xz") return ["x", "z"];
+  if (label === "yz") return ["y", "z"];
+  return ["x", "y"];
+}
+
+$("export-png").addEventListener("click", exportPng);
+$("export-csv").addEventListener("click", exportCsv);
+
 // ───────────────────────── readouts ─────────────────────────
 const fmtFreq = (hz) => (hz >= 1000 ? `${(hz / 1000).toFixed(2)} kHz` : `${hz | 0} Hz`);
 const fmtLen = (m) =>
