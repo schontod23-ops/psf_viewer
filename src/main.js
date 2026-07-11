@@ -46,9 +46,11 @@ const state = {
   dyn: 30,
   levels: 10,
   lines: true,
-  // source marker
+  // source marker (primary source)
   srcPos: [0, 0, 1],
   srcAtFocus: false,
+  // additional incoherent sources: { pos:[x,y,z], amplitude }
+  extraSources: [],
   // 3D options
   multiplane: false,
   raytrace: false,
@@ -379,13 +381,24 @@ function buildRequest(planeName) {
   return {
     array,
     focus,
-    source: state.srcPos.slice(),
+    sources: activeSources(),
     frequency: state.frequency,
     speed_of_sound: state.c,
     shading: state.shading,
     steering: state.steering,
     diag_removal: state.diagRemoval,
   };
+}
+
+// The scene's incoherent point sources. The primary source is always the
+// one driven by the Source panel (state.srcPos); any extra sources the user
+// has added live in state.extraSources as {pos:[x,y,z], amplitude}.
+function activeSources() {
+  const list = [{ pos: state.srcPos.slice(), amplitude: 1 }];
+  for (const s of state.extraSources) {
+    list.push({ pos: s.pos.slice(), amplitude: s.amplitude });
+  }
+  return list;
 }
 
 async function computePlane(planeName) {
@@ -776,18 +789,33 @@ function jsCompute(req) {
   const reference = centroid(arr.pos);
   const formulation = req.steering || "I";
   const diagRemoval  = !!req.diag_removal;
-  const source = req.source || f.center;
+  const sources = (req.sources && req.sources.length)
+    ? req.sources
+    : [{ pos: req.source || f.center, amplitude: 1 }];
+  const nsrc = sources.length;
 
-  // actual free-field pressure at each mic from the unit source
-  const p = arr.pos.map((m) => {
-    const d = Math.max(1e-9, vdist(m, source));
-    const ph = -k * d;
-    return [Math.cos(ph) / d, Math.sin(ph) / d];
-  });
+  // Free-field pressure at each mic from each source (p[mi][s]) and the CSM
+  // diagonal Cmm[mi] = Σ_s |p_{s,mi}|².
+  const p = [], cmm = [];
+  for (let mi = 0; mi < arr.pos.length; mi++) {
+    const row = [];
+    let diag = 0;
+    for (let s = 0; s < nsrc; s++) {
+      const d = Math.max(1e-9, vdist(arr.pos[mi], sources[s].pos));
+      const ph = -k * d;
+      const a = sources[s].amplitude;
+      const pr = a * Math.cos(ph) / d, pi = a * Math.sin(ph) / d;
+      row.push([pr, pi]);
+      diag += pr * pr + pi * pi;
+    }
+    p.push(row);
+    cmm.push(diag);
+  }
 
   const wsum = weights.reduce((a, b) => a + b, 0);
   const wsumSafe = Math.abs(wsum) < 1e-30 ? 1 : wsum;
   const needsNormPass = formulation === "III" || formulation === "IV";
+  const sRe = new Float64Array(nsrc), sIm = new Float64Array(nsrc);
 
   const raw = new Float64Array(g.nx * g.ny);
   for (let j = 0; j < g.ny; j++) {
@@ -811,7 +839,9 @@ function jsCompute(req) {
       else norm = wsumSafe;
       const invNorm = Math.abs(norm) < 1e-30 ? 1 : 1 / norm;
 
-      let sRe = 0, sIm = 0, diagSum = 0;
+      sRe.fill(0);
+      sIm.fill(0);
+      let diagSum = 0;
       for (let mi = 0; mi < arr.pos.length; mi++) {
         const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
         const gm = r0 / rm;
@@ -823,12 +853,16 @@ function jsCompute(req) {
         else { yRe = c; yIm = s; }
         const hRe = weights[mi] * yRe * invNorm;
         const hIm = weights[mi] * yIm * invNorm;
-        const [pRe, pIm] = p[mi];
-        sRe += hRe * pRe + hIm * pIm;
-        sIm += hRe * pIm - hIm * pRe;
-        if (diagRemoval) diagSum += (hRe * hRe + hIm * hIm) * (pRe * pRe + pIm * pIm);
+        const prow = p[mi];
+        for (let s2 = 0; s2 < nsrc; s2++) {
+          const pRe = prow[s2][0], pIm = prow[s2][1];
+          sRe[s2] += hRe * pRe + hIm * pIm;
+          sIm[s2] += hRe * pIm - hIm * pRe;
+        }
+        if (diagRemoval) diagSum += (hRe * hRe + hIm * hIm) * cmm[mi];
       }
-      let power = sRe * sRe + sIm * sIm;
+      let power = 0;
+      for (let s2 = 0; s2 < nsrc; s2++) power += sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
       if (diagRemoval) power -= diagSum;
       raw[j * g.nx + i] = Math.max(0, power);
     }

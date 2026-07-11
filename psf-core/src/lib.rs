@@ -425,22 +425,50 @@ impl FocusConfig {
     }
 }
 
+// ─────────────────────────────────────────────────────────── sources
+
+/// A single incoherent point source in the scene.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct Source {
+    /// World position (metres).
+    pub pos: [f64; 3],
+    /// Linear pressure amplitude (1.0 = reference). Sources are assumed
+    /// mutually incoherent, so their cross-spectral matrices add in power.
+    #[serde(default = "default_amplitude")]
+    pub amplitude: f64,
+}
+
+fn default_amplitude() -> f64 {
+    1.0
+}
+
+impl Source {
+    pub fn unit(pos: [f64; 3]) -> Self {
+        Source {
+            pos,
+            amplitude: 1.0,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────── beamformer
 
-/// Compute the normalised PSF (dB) over the focus grid, using a rank-1
-/// cross-spectral matrix `C = p·pᴴ` built from a single unit point source at
-/// `source` (`p_m` = free-field pressure at mic `m`), steered with the
-/// chosen Sarradj formulation. `source` need not lie on (or even near) the
-/// scanned focus plane. With `diag_removal` the CSM diagonal (autopower)
-/// terms are subtracted before computing the beamformer output, i.e.
-///   P(t) = hᴴ(t)·C·h(t) − diag_removal · Σ_m |h_m(t)|²|p_m|²
+/// Compute the normalised beamformer map (dB) over the focus grid for one or
+/// more incoherent point `sources`. The cross-spectral matrix is
+/// `C = Σ_s a_s²·gₛ·gₛᴴ` where `gₛ` is source `s`'s free-field pressure
+/// vector at the mics (1/r falloff + phase) and `a_s` its amplitude. The map
+/// is steered with the chosen Sarradj formulation; with a single unit source
+/// this reduces to the classic point-spread function. `sources` need not lie
+/// on the scanned focus plane. With `diag_removal` the CSM diagonal
+/// (autopower) terms are subtracted before forming the beamformer output:
+///   P(t) = Σ_s |hᴴ(t)·gₛ|² − diag_removal · Σ_m |h_m(t)|²·C_mm
 /// Returns row-major values (`v` outer, `u` inner), length `nx*ny`, in dB
 /// relative to the grid's peak value (peak = 0 dB).
 pub fn compute_psf(
     array: &Array,
     weights: &[f64],
     focus: &FocusConfig,
-    source: [f64; 3],
+    sources: &[Source],
     frequency: f64,
     speed_of_sound: f64,
     formulation: SteeringFormulation,
@@ -448,6 +476,9 @@ pub fn compute_psf(
 ) -> Result<(Grid, Vec<f32>), String> {
     if array.is_empty() {
         return Err("No microphones to compute with.".into());
+    }
+    if sources.is_empty() {
+        return Err("At least one source is required.".into());
     }
     if frequency <= 0.0 || speed_of_sound <= 0.0 {
         return Err("Frequency and speed of sound must be positive.".into());
@@ -458,18 +489,28 @@ pub fn compute_psf(
 
     let reference = array.centroid();
     let mics = &array.pos;
+    let nsrc = sources.len();
 
-    // Actual free-field pressure at each mic from the unit source
-    // (1/r amplitude falloff + propagation phase).
-    let p: Vec<(f64, f64)> = mics
-        .iter()
-        .map(|m| {
-            let d = dist(*m, source).max(1e-9);
+    // Free-field pressure at each mic from each source, laid out mic-major
+    // (`p[m][s]`), plus the CSM diagonal C_mm = Σ_s |p_{s,m}|² per mic.
+    let mut p: Vec<Vec<(f64, f64)>> = Vec::with_capacity(mics.len());
+    let mut cmm: Vec<f64> = Vec::with_capacity(mics.len());
+    for m in mics.iter() {
+        let mut row = Vec::with_capacity(nsrc);
+        let mut diag = 0.0f64;
+        for src in sources {
+            let d = dist(*m, src.pos).max(1e-9);
             let phase = -k * d;
             let (s, c) = phase.sin_cos();
-            (c / d, s / d)
-        })
-        .collect();
+            let a = src.amplitude;
+            let pr = a * c / d;
+            let pi = a * s / d;
+            row.push((pr, pi));
+            diag += pr * pr + pi * pi;
+        }
+        p.push(row);
+        cmm.push(diag);
+    }
 
     let wsum: f64 = weights.iter().sum();
     let wsum_safe = if wsum.abs() < 1e-30 { 1.0 } else { wsum };
@@ -481,6 +522,9 @@ pub fn compute_psf(
         .enumerate()
         .for_each(|(j, row)| {
             let vv = grid.v[j];
+            // Per-source beamformer accumulators, reused across the row.
+            let mut s_re = vec![0f64; nsrc];
+            let mut s_im = vec![0f64; nsrc];
             for (i, cell) in row.iter_mut().enumerate() {
                 let uu = grid.u[i];
                 let point = add(focus.center, add(scale(uh, uu), scale(vh, vv)));
@@ -505,8 +549,12 @@ pub fn compute_psf(
                 };
                 let inv_norm = if norm.abs() < 1e-30 { 1.0 } else { 1.0 / norm };
 
-                let mut s_re = 0.0f64;
-                let mut s_im = 0.0f64;
+                for v in s_re.iter_mut() {
+                    *v = 0.0;
+                }
+                for v in s_im.iter_mut() {
+                    *v = 0.0;
+                }
                 let mut diag_sum = 0.0f64;
                 for (m, mic) in mics.iter().enumerate() {
                     let rm = dist(*mic, point).max(1e-9);
@@ -521,15 +569,20 @@ pub fn compute_psf(
                     };
                     let h_re = weights[m] * y_re * inv_norm;
                     let h_im = weights[m] * y_im * inv_norm;
-                    let (p_re, p_im) = p[m];
-                    // S += conj(h_m) * p_m
-                    s_re += h_re * p_re + h_im * p_im;
-                    s_im += h_re * p_im - h_im * p_re;
+                    // Sₛ += conj(h_m) · p_{s,m} for each source.
+                    for (s_idx, &(p_re, p_im)) in p[m].iter().enumerate() {
+                        s_re[s_idx] += h_re * p_re + h_im * p_im;
+                        s_im[s_idx] += h_re * p_im - h_im * p_re;
+                    }
                     if diag_removal {
-                        diag_sum += (h_re * h_re + h_im * h_im) * (p_re * p_re + p_im * p_im);
+                        diag_sum += (h_re * h_re + h_im * h_im) * cmm[m];
                     }
                 }
-                let mut power = s_re * s_re + s_im * s_im;
+                // Incoherent sum of per-source beamformer powers.
+                let mut power = 0.0f64;
+                for s_idx in 0..nsrc {
+                    power += s_re[s_idx] * s_re[s_idx] + s_im[s_idx] * s_im[s_idx];
+                }
                 if diag_removal {
                     power -= diag_sum;
                 }
@@ -537,8 +590,8 @@ pub fn compute_psf(
             }
         });
 
-    // Normalise to the grid's own peak rather than assuming the source sits
-    // at the geometric centre of the scan grid — it may not (see `source`).
+    // Normalise to the grid's own peak rather than assuming a source sits at
+    // the geometric centre of the scan grid — it may not (see `sources`).
     let p0 = raw.iter().cloned().fold(0.0f64, f64::max).max(1e-30);
 
     let values: Vec<f32> = raw
@@ -820,7 +873,7 @@ mod tests {
             &a,
             &w,
             &focus(),
-            focus().center,
+            &[Source::unit(focus().center)],
             5000.0,
             343.0,
             SteeringFormulation::I,
@@ -844,7 +897,7 @@ mod tests {
             &a,
             &w,
             &focus(),
-            focus().center,
+            &[Source::unit(focus().center)],
             4000.0,
             343.0,
             SteeringFormulation::I,
@@ -866,11 +919,11 @@ mod tests {
         let w = weights_for(&a, Shading::Uniform);
         let f = focus();
         let (g1, v1) =
-            compute_psf(&a, &w, &f, f.center, 2000.0, 343.0, SteeringFormulation::I, false)
+            compute_psf(&a, &w, &f, &[Source::unit(f.center)],2000.0, 343.0, SteeringFormulation::I, false)
                 .unwrap();
         let m1 = metrics(&a, &g1, &v1, 343.0);
         let (g2, v2) =
-            compute_psf(&a, &w, &f, f.center, 8000.0, 343.0, SteeringFormulation::I, false)
+            compute_psf(&a, &w, &f, &[Source::unit(f.center)],8000.0, 343.0, SteeringFormulation::I, false)
                 .unwrap();
         let m2 = metrics(&a, &g2, &v2, 343.0);
         let b1 = m1.beamwidth_u.unwrap();
@@ -886,7 +939,7 @@ mod tests {
             &a,
             &w,
             &focus(),
-            focus().center,
+            &[Source::unit(focus().center)],
             3000.0,
             343.0,
             SteeringFormulation::I,
@@ -925,7 +978,7 @@ mod tests {
                     &a,
                     &w,
                     &near_focus(),
-                    near_focus().center,
+                    &[Source::unit(near_focus().center)],
                     4000.0,
                     343.0,
                     formulation,
@@ -956,7 +1009,7 @@ mod tests {
             &a,
             &w,
             &near_focus(),
-            near_focus().center,
+            &[Source::unit(near_focus().center)],
             4000.0,
             343.0,
             SteeringFormulation::I,
@@ -967,7 +1020,7 @@ mod tests {
             &a,
             &w,
             &near_focus(),
-            near_focus().center,
+            &[Source::unit(near_focus().center)],
             4000.0,
             343.0,
             SteeringFormulation::Iii,
@@ -997,7 +1050,7 @@ mod tests {
             &a,
             &w,
             &near_focus(),
-            near_focus().center,
+            &[Source::unit(near_focus().center)],
             4000.0,
             343.0,
             SteeringFormulation::I,
@@ -1019,7 +1072,7 @@ mod tests {
         let f = focus();
 
         let (g0, v0) =
-            compute_psf(&a, &w, &f, f.center, 5000.0, 343.0, SteeringFormulation::I, false)
+            compute_psf(&a, &w, &f, &[Source::unit(f.center)],5000.0, 343.0, SteeringFormulation::I, false)
                 .unwrap();
         let peak0 = v0
             .iter()
@@ -1033,7 +1086,7 @@ mod tests {
         // in x) — the peak must move with it, not stay at the grid centre.
         let offset_source = [0.3, 0.0, 1.0];
         let (g1, v1) =
-            compute_psf(&a, &w, &f, offset_source, 5000.0, 343.0, SteeringFormulation::I, false)
+            compute_psf(&a, &w, &f, &[Source::unit(offset_source)], 5000.0, 343.0, SteeringFormulation::I, false)
                 .unwrap();
         let peak1 = v1
             .iter()
@@ -1045,6 +1098,93 @@ mod tests {
             peak1,
             (g1.ny / 2) * g1.nx + (g1.nx / 2),
             "moving the source should move the PSF peak away from the grid centre"
+        );
+    }
+
+    // Nearest grid cell to a given (u, v) offset from the focus centre.
+    fn cell_at(g: &Grid, u: f64, v: f64) -> usize {
+        let i = g
+            .u
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1 - u).abs().total_cmp(&(b.1 - u).abs()))
+            .unwrap()
+            .0;
+        let j = g
+            .v
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1 - v).abs().total_cmp(&(b.1 - v).abs()))
+            .unwrap()
+            .0;
+        j * g.nx + i
+    }
+
+    #[test]
+    fn two_sources_make_two_peaks() {
+        // Two well-separated equal sources should each produce a ~0 dB local
+        // maximum at their own location in the beamformer map.
+        let a = build_array(&sunflower(80, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus(); // z = 1 plane, ±0.5 m in u,v
+        let sources = [
+            Source::unit([-0.3, 0.0, 1.0]),
+            Source::unit([0.3, 0.0, 1.0]),
+        ];
+        let (g, v) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &sources,
+            8000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
+        let left = v[cell_at(&g, -0.3, 0.0)];
+        let right = v[cell_at(&g, 0.3, 0.0)];
+        let middle = v[cell_at(&g, 0.0, 0.0)];
+        assert!(left > -3.0, "left source should be near peak, got {left} dB");
+        assert!(right > -3.0, "right source should be near peak, got {right} dB");
+        // The point between the two sources should be clearly lower.
+        assert!(
+            middle < left - 3.0 && middle < right - 3.0,
+            "midpoint {middle} dB should sit well below both source peaks"
+        );
+    }
+
+    #[test]
+    fn source_amplitude_scales_relative_level() {
+        // A quieter second source should map to a lower relative level than an
+        // equal-amplitude one, given identical geometry.
+        let a = build_array(&sunflower(80, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let quiet = [
+            Source::unit([-0.3, 0.0, 1.0]),
+            Source {
+                pos: [0.3, 0.0, 1.0],
+                amplitude: 0.1,
+            },
+        ];
+        let (g, v) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &quiet,
+            8000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
+        let left = v[cell_at(&g, -0.3, 0.0)]; // loud → normalised peak ≈ 0 dB
+        let right = v[cell_at(&g, 0.3, 0.0)]; // quiet → well below 0 dB
+        assert!(left > -1.0, "loud source should be near 0 dB, got {left}");
+        assert!(
+            right < left - 10.0,
+            "0.1-amplitude source should be ~20 dB down, got {right} dB vs {left} dB"
         );
     }
 }

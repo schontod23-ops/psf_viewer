@@ -3,7 +3,7 @@
 
 use psf_core::{
     build_array, compute_psf, metrics as compute_metrics, weights_for, ArraySource, FocusConfig,
-    Metrics, Shading, SteeringFormulation,
+    Metrics, Shading, Source, SteeringFormulation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 pub struct ComputeRequest {
     array: ArraySource,
     focus: FocusConfig,
-    /// Where the single unit test source actually sits — independent of
-    /// `focus.center`, which is just the centre of the scanned grid.
-    source: [f64; 3],
+    /// One or more incoherent point sources, independent of `focus.center`
+    /// (which is just the centre of the scanned grid).
+    sources: Vec<Source>,
     frequency: f64,
     speed_of_sound: f64,
     shading: Shading,
@@ -45,7 +45,7 @@ fn compute(req: ComputeRequest) -> Result<ComputeResponse, String> {
         &array,
         &weights,
         &req.focus,
-        req.source,
+        &req.sources,
         req.frequency,
         req.speed_of_sound,
         req.steering,
