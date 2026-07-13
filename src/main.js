@@ -490,6 +490,7 @@ async function compute() {
     // Update 3D geometry (always use primary for mics/corners)
     geo.update(primary.mics, primary.weights, primary.corners, state.fplane, lastResults, state.multiplane);
     geo.updateSource(state.srcPos);
+    saveSession();
   } catch (e) {
     toast(e);
   }
@@ -686,11 +687,11 @@ function syncAllControls() {
   geo.updateExtraSources(state.extraSources);
 }
 
-function applyConfig(cfg) {
+function applyConfig(cfg, silent = false) {
   const s = cfg && cfg.state;
   if (!s || typeof s !== "object") {
-    toast("Not a valid PSF Array Viewer config file.");
-    return;
+    if (!silent) toast("Not a valid PSF Array Viewer config file.");
+    return false;
   }
   Object.assign(state, s);
   // Ensure the 3-vectors are real arrays (in case of a partial file).
@@ -702,7 +703,18 @@ function applyConfig(cfg) {
     : [];
   syncAllControls();
   compute();
-  toast("Configuration loaded.");
+  if (!silent) toast("Configuration loaded.");
+  return true;
+}
+
+// ── session persistence: remember the last setup across reloads ──
+const SESSION_KEY = "psf-viewer:session";
+function saveSession() {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(currentConfig()));
+  } catch {
+    /* storage full or unavailable — non-fatal */
+  }
 }
 
 $("config-save").addEventListener("click", saveConfig);
@@ -1073,4 +1085,20 @@ function metricsJS(arr, g, values, c) {
 })();
 
 // ───────────────────────── go ─────────────────────────
-compute();
+// Restore the previous session if one was saved, else compute defaults.
+(function boot() {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(SESSION_KEY);
+  } catch {
+    raw = null;
+  }
+  if (raw) {
+    try {
+      if (applyConfig(JSON.parse(raw), true)) return;
+    } catch {
+      /* corrupt session — fall through to defaults */
+    }
+  }
+  compute();
+})();
