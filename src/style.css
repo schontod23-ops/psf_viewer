@@ -238,6 +238,17 @@ input[type="number"]:focus, .file-btn:focus-visible {
   outline: none;
 }
 .triple { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+.src-row {
+  display: grid; grid-template-columns: repeat(4, 1fr) auto; gap: 5px;
+  align-items: center; margin-bottom: 6px;
+}
+.src-row input[type="number"] { padding: 6px 6px; font-size: 11px; }
+.src-row .src-del {
+  cursor: pointer; background: transparent; border: 1px solid var(--stroke);
+  border-radius: 6px; color: var(--ink-dim); width: 26px; height: 28px;
+  font-size: 15px; line-height: 1;
+}
+.src-row .src-del:hover { color: var(--warn); border-color: var(--warn); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: end; }
 .grid2 > span.full, .grid2 > label { grid-column: auto; }
 .grid2 label { display: block; }

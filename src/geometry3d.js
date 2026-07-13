@@ -362,6 +362,35 @@ export class Geometry3D {
     this._markDirty();
   }
 
+  // Show any additional incoherent sources as a pool of dimmer sprites.
+  updateExtraSources(list) {
+    if (!this._extraSprites) this._extraSprites = [];
+    const arr = list || [];
+    // Grow the pool as needed.
+    while (this._extraSprites.length < arr.length) {
+      const mat = new THREE.SpriteMaterial({
+        map: this.srcSprite,
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const sp = new THREE.Sprite(mat);
+      this.scene.add(sp);
+      this._extraSprites.push(sp);
+    }
+    for (let i = 0; i < this._extraSprites.length; i++) {
+      const sp = this._extraSprites[i];
+      if (i < arr.length) {
+        sp.position.set(arr[i].pos[0], arr[i].pos[1], arr[i].pos[2]);
+        sp.visible = true;
+      } else {
+        sp.visible = false;
+      }
+    }
+    this._markDirty();
+  }
+
   // ── Path tracing ──────────────────────────────────────────────
   async setRaytrace(enabled) {
     this._raytrace = enabled;
@@ -403,10 +432,11 @@ export class Geometry3D {
     this._raf = requestAnimationFrame(this._animate);
     this.controls.update();
 
-    // Pulse source marker
-    if (this.sourceMesh) {
-      const s = 0.06 + 0.02 * Math.sin(performance.now() * 0.003);
-      this.sourceMesh.scale.setScalar(s);
+    // Pulse source markers
+    const s = 0.06 + 0.02 * Math.sin(performance.now() * 0.003);
+    if (this.sourceMesh) this.sourceMesh.scale.setScalar(s);
+    if (this._extraSprites) {
+      for (const sp of this._extraSprites) if (sp.visible) sp.scale.setScalar(s * 0.85);
     }
 
     if (this._raytrace && this._ptReady && this._ptRenderer) {

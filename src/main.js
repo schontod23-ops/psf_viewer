@@ -268,6 +268,53 @@ $("src-at-focus").addEventListener("change", (e) => {
   schedule();
 });
 
+// ── additional sources editor ──
+function renderExtraSources() {
+  const host = $("extra-sources");
+  host.innerHTML = "";
+  state.extraSources.forEach((src, idx) => {
+    const row = document.createElement("div");
+    row.className = "src-row";
+    const mk = (val, step, label, on) => {
+      const el = document.createElement("input");
+      el.type = "number";
+      el.value = val;
+      el.step = step;
+      el.setAttribute("aria-label", label);
+      el.addEventListener("input", () => { on(parseFloat(el.value)); });
+      return el;
+    };
+    row.appendChild(mk(src.pos[0], 0.05, `source ${idx + 2} x`, (v) => { src.pos[0] = v || 0; onExtraChanged(); }));
+    row.appendChild(mk(src.pos[1], 0.05, `source ${idx + 2} y`, (v) => { src.pos[1] = v || 0; onExtraChanged(); }));
+    row.appendChild(mk(src.pos[2], 0.05, `source ${idx + 2} z`, (v) => { src.pos[2] = v || 0; onExtraChanged(); }));
+    row.appendChild(mk(src.amplitude, 0.1, `source ${idx + 2} amplitude`, (v) => { src.amplitude = isFinite(v) ? v : 1; onExtraChanged(); }));
+    const del = document.createElement("button");
+    del.className = "src-del";
+    del.textContent = "×";
+    del.title = "Remove source";
+    del.addEventListener("click", () => {
+      state.extraSources.splice(idx, 1);
+      renderExtraSources();
+      onExtraChanged();
+    });
+    row.appendChild(del);
+    host.appendChild(row);
+  });
+}
+
+function onExtraChanged() {
+  geo.updateExtraSources(state.extraSources);
+  schedule();
+}
+
+$("add-source").addEventListener("click", () => {
+  // New source seeded just off the primary source so it's visible.
+  const base = state.srcPos;
+  state.extraSources.push({ pos: [base[0] + 0.2, base[1], base[2]], amplitude: 1 });
+  renderExtraSources();
+  onExtraChanged();
+});
+
 // Multiplane toggle
 $("multiplane").addEventListener("change", (e) => {
   state.multiplane = e.target.checked;
@@ -447,6 +494,18 @@ async function compute() {
   }
 }
 
+// Project each source's world position onto the focus plane's (u,v) axes,
+// relative to the focus centre, so the plot can mark it.
+function sourcesInPlane(plane) {
+  const [uh, vh] = planeBasis(plane);
+  const c = state.fcenter;
+  const proj = (pos) => ({
+    u: (pos[0] - c[0]) * uh[0] + (pos[1] - c[1]) * uh[1] + (pos[2] - c[2]) * uh[2],
+    v: (pos[0] - c[0]) * vh[0] + (pos[1] - c[1]) * vh[1] + (pos[2] - c[2]) * vh[2],
+  });
+  return activeSources().map((s) => proj(s.pos));
+}
+
 function drawPlot(res) {
   plot.render({
     values: res.values,
@@ -460,6 +519,7 @@ function drawPlot(res) {
     levels: state.levels,
     showLines: state.lines,
     planeLabel: state.fplane,
+    sources: sourcesInPlane(state.fplane),
   });
   $("psf-plane").textContent = " · " + state.fplane;
 }
@@ -599,9 +659,11 @@ function syncAllControls() {
   if (state.csvName) $("csv-status").textContent = `Loaded ${state.csvName}`;
 
   updateSourceVisibility();
+  renderExtraSources();
   geo.setMultiplane(state.multiplane);
   geo.setRaytrace(state.raytrace);
   geo.updateSource(state.srcPos);
+  geo.updateExtraSources(state.extraSources);
 }
 
 function applyConfig(cfg) {
@@ -615,6 +677,9 @@ function applyConfig(cfg) {
   state.acenter = Array.isArray(s.acenter) ? s.acenter.slice() : state.acenter;
   state.fcenter = Array.isArray(s.fcenter) ? s.fcenter.slice() : state.fcenter;
   state.srcPos = Array.isArray(s.srcPos) ? s.srcPos.slice() : state.srcPos;
+  state.extraSources = Array.isArray(s.extraSources)
+    ? s.extraSources.map((x) => ({ pos: (x.pos || [0, 0, 0]).slice(), amplitude: x.amplitude ?? 1 }))
+    : [];
   syncAllControls();
   compute();
   toast("Configuration loaded.");

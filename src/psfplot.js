@@ -142,16 +142,35 @@ export class PSFPlot {
     c.lineWidth = 1;
     c.strokeRect(ox + 0.5, oy + 0.5, mapW, mapH);
 
-    // crosshair at source (centre)
-    c.strokeStyle = "rgba(255,255,255,0.35)";
-    c.setLineDash([3 * dpr, 4 * dpr]);
-    c.beginPath();
-    c.moveTo(ox + mapW / 2, oy);
-    c.lineTo(ox + mapW / 2, oy + mapH);
-    c.moveTo(ox, oy + mapH / 2);
-    c.lineTo(ox + mapW, oy + mapH / 2);
-    c.stroke();
-    c.setLineDash([]);
+    // source markers — a small crosshair at each source's in-plane (u,v).
+    // Falls back to the grid centre if no sources were supplied.
+    const u0m = u[0], u1m = u[u.length - 1];
+    const v0m = v[0], v1m = v[v.length - 1];
+    const srcs = (args.sources && args.sources.length)
+      ? args.sources
+      : [{ u: (u0m + u1m) / 2, v: (v0m + v1m) / 2 }];
+    for (const sm of srcs) {
+      // Skip sources whose in-plane projection lands outside the map.
+      if (sm.u < Math.min(u0m, u1m) || sm.u > Math.max(u0m, u1m)) continue;
+      if (sm.v < Math.min(v0m, v1m) || sm.v > Math.max(v0m, v1m)) continue;
+      const px = ox + ((sm.u - u0m) / (u1m - u0m)) * mapW;
+      const py = oy + mapH - ((sm.v - v0m) / (v1m - v0m)) * mapH;
+      const r = 6 * dpr;
+      c.strokeStyle = "rgba(255,255,255,0.7)";
+      c.lineWidth = 1.2 * dpr;
+      c.beginPath();
+      c.arc(px, py, r, 0, Math.PI * 2);
+      c.moveTo(px - r * 1.7, py);
+      c.lineTo(px - r * 0.6, py);
+      c.moveTo(px + r * 0.6, py);
+      c.lineTo(px + r * 1.7, py);
+      c.moveTo(px, py - r * 1.7);
+      c.lineTo(px, py - r * 0.6);
+      c.moveTo(px, py + r * 0.6);
+      c.lineTo(px, py + r * 1.7);
+      c.stroke();
+    }
+    c.lineWidth = 1;
 
     // axes
     c.fillStyle = DIM;
