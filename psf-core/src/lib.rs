@@ -127,6 +127,15 @@ pub enum ArraySource {
     },
     /// Positions parsed from CSV text (3 columns x,y,z; optional 4th = weight).
     Csv { text: String },
+    /// An explicit, hand-edited microphone layout. Any generated array becomes a
+    /// `Manual` one as soon as the user drags a microphone in the editor, so the
+    /// edit survives save/load instead of being clobbered by the generator.
+    Manual {
+        pos: Vec<[f64; 3]>,
+        /// Optional per-mic weights (overriding the shading window), as for CSV.
+        #[serde(default)]
+        weights: Option<Vec<f64>>,
+    },
 }
 
 /// Resolved microphone layout.
@@ -280,6 +289,23 @@ pub fn build_array(src: &ArraySource) -> Result<Array, String> {
             })
         }
         ArraySource::Csv { text } => parse_csv(text),
+        ArraySource::Manual { pos, weights } => {
+            if pos.is_empty() {
+                return Err("Array needs at least one microphone.".into());
+            }
+            if !pos.iter().all(|p| p.iter().all(|c| c.is_finite())) {
+                return Err("Microphone positions must be finite numbers.".into());
+            }
+            if let Some(w) = weights {
+                if w.len() != pos.len() {
+                    return Err("Manual array: one weight per microphone is required.".into());
+                }
+            }
+            Ok(Array {
+                pos: pos.clone(),
+                csv_weights: weights.clone(),
+            })
+        }
     }
 }
 
@@ -1272,6 +1298,27 @@ mod tests {
         let a = parse_csv("0 0 0\n0.1 0.1 0\n").unwrap();
         assert_eq!(a.len(), 2);
         assert!(a.csv_weights.is_none());
+    }
+
+    #[test]
+    fn manual_array_round_trips_positions_and_weights() {
+        let a = build_array(&ArraySource::Manual {
+            pos: vec![[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+            weights: Some(vec![1.0, 0.5, 0.25]),
+        })
+        .unwrap();
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.csv_weights.as_ref().unwrap()[2], 0.25);
+        // Explicit weights win over the shading window, as with CSV.
+        assert_eq!(weights_for(&a, Shading::Hann)[1], 0.5);
+
+        // Weights, when given, must match the mic count.
+        assert!(build_array(&ArraySource::Manual {
+            pos: vec![[0.0, 0.0, 0.0]],
+            weights: Some(vec![1.0, 1.0]),
+        })
+        .is_err());
+        assert!(build_array(&ArraySource::Manual { pos: vec![], weights: None }).is_err());
     }
 
     fn focus() -> FocusConfig {

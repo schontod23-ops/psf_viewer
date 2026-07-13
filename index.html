@@ -39,6 +39,7 @@
             <button data-val="grid">Grid</button>
             <button data-val="cross">Cross</button>
             <button data-val="csv">CSV</button>
+            <button data-val="manual">Manual</button>
           </div>
 
           <!-- Sunflower / Ring share microphone-count + diameter -->
@@ -132,6 +133,13 @@
             <input type="file" id="csv-input" accept=".csv,.txt,.tsv" hidden />
             <p class="hint" id="csv-status">3 columns x,y,z (metres). Optional 4th = weight.</p>
           </div>
+
+          <div data-when="source=manual" hidden>
+            <p class="hint" id="manual-status">Hand-edited layout.</p>
+          </div>
+
+          <button class="file-btn" id="mic-edit" style="margin-top:12px">Edit microphones…</button>
+          <p class="hint">Move individual microphones. Editing turns the array into a hand-edited layout.</p>
         </section>
 
         <section class="group">
@@ -437,6 +445,33 @@
         <div class="modal-foot">
           <button class="file-btn" id="settings-reset">Reset to defaults</button>
           <button class="file-btn" id="settings-apply">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── mic editor modal ───────────────────────── -->
+    <div class="modal-overlay" id="mic-overlay" hidden>
+      <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="mic-title">
+        <div class="modal-head">
+          <h2 id="mic-title">Microphone editor<span class="dim" id="mic-sub"></span></h2>
+          <button class="modal-close" id="mic-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="mic-canvas" id="mic-canvas"></div>
+          <div class="mic-bar">
+            <label class="check" style="margin:0">
+              <input type="checkbox" id="mic-snap-on" />
+              <span>Snap to grid</span>
+            </label>
+            <label class="mic-step"><span>step (m)</span>
+              <input type="number" id="mic-snap" value="0.01" min="0.001" step="0.001" />
+            </label>
+            <span class="hint" style="margin:0">Click to select · Ctrl+click to add · drag a box to select many · drag to move · arrows nudge · Del removes</span>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="mic-reset">Reset</button>
+          <button class="file-btn" id="mic-apply">Apply</button>
         </div>
       </div>
     </div>

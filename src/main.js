@@ -2,6 +2,7 @@ import "./style.css";
 import { PSFPlot } from "./psfplot.js";
 import { Geometry3D } from "./geometry3d.js";
 import { LineChart, CHART_PALETTE } from "./linechart.js";
+import { MicEditor } from "./micedit.js";
 
 // ───────────────────────── Tauri detection ─────────────────────────
 const isTauri = !!(window.__TAURI_INTERNALS__ || window.__TAURI__);
@@ -34,6 +35,9 @@ const state = {
   acenter: [0, 0, 0],
   csvText: null,
   csvName: null,
+  // hand-edited layout (source === "manual"); survives save/load
+  manualPos: null,
+  manualWeights: null,
   fplane: "xy",
   fcenter: [0, 0, 1],
   width: 1,
@@ -204,6 +208,11 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("settings-overlay").hidden) closeSettings();
   else if (!$("sweep-overlay").hidden) $("sweep-overlay").hidden = true;
+  // The editor's own canvas uses Esc to clear its selection, so only close the
+  // dialog when the canvas does not have focus.
+  else if (!$("mic-overlay").hidden && document.activeElement !== (micEditor && micEditor.canvas)) {
+    $("mic-overlay").hidden = true;
+  }
 });
 
 $("settings-apply").addEventListener("click", () => {
@@ -452,6 +461,12 @@ function buildArrayDescriptor() {
       return { kind: "cross", n: state.crossN, length: state.crossLength, center, plane };
     case "csv":
       return { kind: "csv", text: state.csvText || "" };
+    case "manual":
+      return {
+        kind: "manual",
+        pos: (state.manualPos || []).map((p) => p.slice()),
+        weights: state.manualWeights ? state.manualWeights.slice() : null,
+      };
     case "sunflower":
     default:
       return { kind: "sunflower", n: state.n, diameter: state.diameter, center, plane };
@@ -521,9 +536,21 @@ async function computePlane(planeName) {
   }
 }
 
-async function compute() {
+// Sources that need something loaded/edited before they can resolve to an array.
+function arrayNotReady() {
   if (state.source === "csv" && !state.csvText) {
-    toast("Load a CSV of microphone positions first.");
+    return "Load a CSV of microphone positions first.";
+  }
+  if (state.source === "manual" && !(state.manualPos && state.manualPos.length)) {
+    return "No hand-edited layout yet — open the microphone editor first.";
+  }
+  return null;
+}
+
+async function compute() {
+  const blocked = arrayNotReady();
+  if (blocked) {
+    toast(blocked);
     return;
   }
 
@@ -675,6 +702,84 @@ function planeAxesLabels(label) {
 $("export-png").addEventListener("click", exportPng);
 $("export-csv").addEventListener("click", exportCsv);
 
+// ───────────────────────── microphone editor ─────────────────────────
+// Seeded from whatever array is currently resolved. Applying an edit converts the
+// array into a `manual` layout — a generator would otherwise overwrite the edit on
+// the next recompute.
+let micEditor = null;
+
+function openMicEditor() {
+  const res = lastResults[state.fplane];
+  if (!res || !res.mics || !res.mics.length) {
+    toast("Nothing to edit yet.");
+    return;
+  }
+  $("mic-overlay").hidden = false;
+  if (!micEditor) {
+    micEditor = new MicEditor($("mic-canvas"));
+    micEditor.onChange = updateMicSub;
+  }
+  // Editing happens in the array's own plane (out-of-plane offsets are preserved).
+  micEditor.load(res.mics.map((p) => p.slice()), state.aplane);
+  applyMicSnap();
+  updateMicSub();
+  micEditor.canvas.focus();
+}
+
+function updateMicSub() {
+  if (!micEditor) return;
+  const sel = micEditor.selectedCount();
+  $("mic-sub").textContent =
+    ` · ${micEditor.count()} mics` + (sel ? ` · ${sel} selected` : "") + ` · ${state.aplane} plane`;
+}
+
+function applyMicSnap() {
+  if (!micEditor) return;
+  const on = $("mic-snap-on").checked;
+  const step = parseFloat($("mic-snap").value);
+  micEditor.setSnap(on && step > 0 ? step : 0);
+  micEditor.draw();
+}
+
+function closeMicEditor() {
+  $("mic-overlay").hidden = true;
+}
+
+$("mic-edit").addEventListener("click", openMicEditor);
+$("mic-close").addEventListener("click", closeMicEditor);
+$("mic-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "mic-overlay") closeMicEditor();
+});
+$("mic-snap-on").addEventListener("change", applyMicSnap);
+$("mic-snap").addEventListener("input", applyMicSnap);
+
+// Reset re-seeds from the live array, discarding edits made in the dialog.
+$("mic-reset").addEventListener("click", () => {
+  const res = lastResults[state.fplane];
+  if (!res) return;
+  micEditor.load(res.mics.map((p) => p.slice()), state.aplane);
+  applyMicSnap();
+  updateMicSub();
+});
+
+$("mic-apply").addEventListener("click", () => {
+  if (!micEditor || !micEditor.count()) return;
+  const before = lastResults[state.fplane];
+  state.manualPos = micEditor.positions();
+  // Keep per-mic weights only if the count still lines up (mics may be deleted);
+  // otherwise fall back to the shading window.
+  const w = before && before.weights;
+  state.manualWeights =
+    w && w.length === state.manualPos.length ? w.slice() : null;
+
+  state.source = "manual";
+  setSeg("source", "manual");
+  updateSourceVisibility();
+  $("manual-status").textContent = `Hand-edited layout · ${state.manualPos.length} microphones.`;
+  closeMicEditor();
+  schedule();
+});
+
 // ───────────────────────── STL model + surface PSF ─────────────────────────
 // The model is parsed client-side (three.js STLLoader). Painting the PSF onto it
 // beamforms the mesh's surface samples through the same engine core the map uses
@@ -788,8 +893,9 @@ function buildSweepRequest() {
 }
 
 async function runSweep() {
-  if (state.source === "csv" && !state.csvText) {
-    toast("Load a CSV of microphone positions first.");
+  const blocked = arrayNotReady();
+  if (blocked) {
+    toast(blocked);
     return;
   }
   const btn = $("sweep-run");
@@ -1098,6 +1204,9 @@ function syncAllControls() {
   $("show-band").checked = false;
   $("show-band-row").hidden = true;
   if (state.csvName) $("csv-status").textContent = `Loaded ${state.csvName}`;
+  if (state.manualPos && state.manualPos.length) {
+    $("manual-status").textContent = `Hand-edited layout · ${state.manualPos.length} microphones.`;
+  }
 
   updateSourceVisibility();
   renderExtraSources();
@@ -1121,6 +1230,8 @@ function applyConfig(cfg, silent = false) {
   state.extraSources = Array.isArray(s.extraSources)
     ? s.extraSources.map((x) => ({ pos: (x.pos || [0, 0, 0]).slice(), amplitude: x.amplitude ?? 1 }))
     : [];
+  state.manualPos = Array.isArray(s.manualPos) ? s.manualPos.map((p) => p.slice()) : null;
+  state.manualWeights = Array.isArray(s.manualWeights) ? s.manualWeights.slice() : null;
   syncAllControls();
   compute();
   if (!silent) toast("Configuration loaded.");
@@ -1251,6 +1362,14 @@ function buildArrayJS(req) {
       pos.push(vadd(a.center, vscale(vh, vv)));
     }
     return { pos, weights: null };
+  }
+  if (a.kind === "manual") {
+    const pos = (a.pos || []).map((p) => p.slice());
+    if (!pos.length) throw "Array needs at least one microphone.";
+    if (a.weights && a.weights.length !== pos.length) {
+      throw "Manual array: one weight per microphone is required.";
+    }
+    return { pos, weights: a.weights ? a.weights.slice() : null };
   }
   const pos = [], w = [];
   let anyW = false;

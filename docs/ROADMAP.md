@@ -69,9 +69,14 @@ change lands in both engines** unless a feature is explicitly native-only.
    painted back as per-vertex colours using the shared colormap LUT (R3). Gated
    behind an explicit "Evaluate surface" button, since per-point evaluation is
    costly. The mesh itself is not persisted — only the units scale.
-5. **Mic selection/move editor.** 2-D top-down editor: click / Ctrl+click /
-   rectangle-marquee selection, drag to move, arrow-key nudge, snap, undo/redo.
-   Editing converts the working array into a `Manual { pos, weights }` source.
+5. **Mic selection/move editor.** *(done)* A 2-D top-down editor (`src/micedit.js`)
+   seeded from whatever array is currently resolved: click to select, Ctrl+click to
+   toggle, drag a marquee to select many, drag to move, arrows to nudge, Del to
+   remove, optional snap-to-grid. Editing happens in the array plane's (u, v) basis
+   but **preserves each mic's out-of-plane component**, so a 3-D layout (e.g. from
+   CSV) survives a round trip. Applying converts the array into a
+   `Manual { pos, weights }` source, which persists through save/load — a generator
+   would otherwise clobber the edit on the next recompute.
 6. **Optional sensor noise floor.** *(done)* White per-sensor variance σ² adds
    `σ²·Σ_m|h_m|²` to the output; diagonal removal cancels it. Exposed as a dB
    slider (`σ² = 10^(dB/10)`) behind an enable checkbox.
