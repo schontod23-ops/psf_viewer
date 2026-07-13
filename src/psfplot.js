@@ -4,7 +4,27 @@
 // square texture (map only) for the 3-D focus plane.
 
 import { contours as d3contours } from "d3-contour";
-import { interpolateTurbo } from "d3-scale-chromatic";
+import {
+  interpolateTurbo,
+  interpolateViridis,
+  interpolateMagma,
+  interpolateInferno,
+  interpolateCividis,
+  interpolateGreys,
+} from "d3-scale-chromatic";
+
+// Available PSF colormaps, keyed by the value used in the UI/state.
+const COLORMAPS = {
+  turbo: interpolateTurbo,
+  viridis: interpolateViridis,
+  magma: interpolateMagma,
+  inferno: interpolateInferno,
+  cividis: interpolateCividis,
+  greys: interpolateGreys,
+};
+function interpFor(name) {
+  return COLORMAPS[name] || interpolateTurbo;
+}
 
 const MONO = '11px "SF Mono","JetBrains Mono","Roboto Mono",ui-monospace,monospace';
 const INK = "#e7eef7";
@@ -62,6 +82,7 @@ export class PSFPlot {
     }
 
     const { values, nx, ny, u, v, dynamicDb, levels, showLines } = args;
+    const interp = interpFor(args.colormap);
 
     // plot geometry (device px)
     const m = { l: 52 * dpr, r: 74 * dpr, t: 30 * dpr, b: 40 * dpr };
@@ -97,11 +118,11 @@ export class PSFPlot {
 
     tctx.clearRect(0, 0, texW, texH);
     // base fill = lowest band colour
-    tctx.fillStyle = interpolateTurbo(0);
+    tctx.fillStyle = interp(0);
     tctx.fillRect(0, 0, texW, texH);
     for (const g of geoms) {
       const s = (g.value + dynamicDb) / dynamicDb; // 0..1
-      tctx.fillStyle = interpolateTurbo(Math.max(0, Math.min(1, s)));
+      tctx.fillStyle = interp(Math.max(0, Math.min(1, s)));
       tctx.beginPath();
       for (const poly of g.coordinates)
         for (const ring of poly) {
@@ -223,7 +244,7 @@ export class PSFPlot {
     const grad = c.createLinearGradient(0, cby, 0, cby + cbh);
     for (let i = 0; i <= 32; i++) {
       const s = i / 32;
-      grad.addColorStop(1 - s, interpolateTurbo(s)); // top = 0 dB
+      grad.addColorStop(1 - s, interp(s)); // top = 0 dB
     }
     c.fillStyle = grad;
     c.fillRect(cbx, cby, cbw, cbh);
@@ -275,6 +296,7 @@ export class PSFPlot {
   // Render a PSF result into an existing canvas/context (no axes, used for off-plane textures).
   renderTexture(res, canvas, ctx) {
     const { values, nx, ny, dynamicDb = 30, levels = 10 } = res;
+    const interp = interpFor(res.colormap);
     const W = canvas.width, H = canvas.height;
     const clamped = new Float64Array(values.length);
     for (let i = 0; i < values.length; i++)
@@ -285,11 +307,11 @@ export class PSFPlot {
     const tx = (gx) => (gx / (nx - 1)) * W;
     const ty = (gy) => H - (gy / (ny - 1)) * H;
     ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = interpolateTurbo(0);
+    ctx.fillStyle = interp(0);
     ctx.fillRect(0, 0, W, H);
     for (const g of geoms) {
       const s = (g.value + dynamicDb) / dynamicDb;
-      ctx.fillStyle = interpolateTurbo(Math.max(0, Math.min(1, s)));
+      ctx.fillStyle = interp(Math.max(0, Math.min(1, s)));
       ctx.beginPath();
       for (const poly of g.coordinates)
         for (const ring of poly) {

@@ -46,6 +46,7 @@ const state = {
   dyn: 30,
   levels: 10,
   lines: true,
+  colormap: "turbo",
   // source marker (primary source)
   srcPos: [0, 0, 1],
   srcAtFocus: false,
@@ -519,6 +520,7 @@ function drawPlot(res) {
     levels: state.levels,
     showLines: state.lines,
     planeLabel: state.fplane,
+    colormap: state.colormap,
     sources: sourcesInPlane(state.fplane),
   });
   $("psf-plane").textContent = " · " + state.fplane;
@@ -531,7 +533,7 @@ function renderOffscreenTexture(res, plane) {
   cv.width = cv.height = SIZE;
   const ctx = cv.getContext("2d");
   plot.renderTexture(
-    { ...res, dynamicDb: state.dyn, levels: state.levels },
+    { ...res, dynamicDb: state.dyn, levels: state.levels, colormap: state.colormap },
     cv, ctx
   );
   geo.setTexture(cv, plane);
@@ -646,6 +648,7 @@ function syncAllControls() {
   setSeg("fplane", state.fplane);
   setSeg("shading", state.shading);
   setSeg("steering", state.steering);
+  setSeg("colormap", state.colormap);
   $("lab-steering").textContent = `Formulation ${state.steering}`;
 
   $("src-at-focus").checked = state.srcAtFocus;
