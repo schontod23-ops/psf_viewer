@@ -343,6 +343,20 @@ input[type="number"]:focus, .file-btn:focus-visible {
 .stage-3d .canvas-host:active { cursor: grabbing; }
 #plot canvas { display: block; }
 
+/* ── 1-D line cut: a strip below the map, only when enabled ── */
+.cut-panel {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 200px;
+  border-top: 1px solid var(--stroke);
+  background: rgba(8, 12, 19, 0.35);
+  padding: 8px 12px 6px;
+  display: none;
+}
+.stage-psf.with-cut .cut-panel { display: block; }
+.stage-psf.with-cut #plot { bottom: 200px; }
+.cut-panel .chart-host { height: 100%; margin: 0; }
+.cut-tools { position: absolute; top: 8px; right: 12px; z-index: 5; display: flex; gap: 6px; }
+.cut-tools .tool-btn { padding: 3px 8px; font-size: 10px; }
+
 /* ───────────────────────────── metrics ───────────────────────────── */
 
 .metrics {

@@ -182,6 +182,26 @@ export class LineChart {
       g.restore();
     }
 
+    // horizontal reference lines (e.g. the −3 dB level)
+    for (const hl of cfg.hLines || []) {
+      if (!isFinite(hl.y) || hl.y < b.y0 || hl.y > b.y1) continue;
+      const py = sy(hl.y);
+      g.save();
+      g.strokeStyle = hl.color || CSS.inkFaint;
+      g.setLineDash([4, 4]);
+      g.lineWidth = 1;
+      g.beginPath();
+      g.moveTo(M.left, py);
+      g.lineTo(w - M.right, py);
+      g.stroke();
+      g.restore();
+      if (hl.label) {
+        g.fillStyle = hl.color || CSS.inkFaint;
+        g.textAlign = "left";
+        g.fillText(hl.label, M.left + 4, py - 7);
+      }
+    }
+
     // vertical markers (e.g. the spatial-aliasing frequency)
     for (const mk of cfg.markers || []) {
       if (!isFinite(mk.x) || mk.x < b.x0 || mk.x > b.x1) continue;

@@ -51,9 +51,12 @@ change lands in both engines** unless a feature is explicitly native-only.
    Driven from an Analysis panel with an explicit "Run sweep" button (too costly
    to run live); results plot in a sweep dialog with the aliasing frequency marked,
    export to CSV, and the band map can replace the single-frequency map.
-2. **Optional 1-D line-cut.** Off by default behind a toggle. Client-side polyline
-   sampling of the current map (`PSFPlot.sampleLine`), rendered in the shared line
-   chart; supports pinning cuts to overlay across settings. No engine change.
+2. **Optional 1-D line-cut.** *(done)* Off by default behind a toggle, so it costs
+   no layout when unused. `PSFPlot.sampleLine` bilinearly samples the current map
+   along a segment; cuts run through the map's peak along u and v and render in
+   the shared line chart with a −3 dB reference. Cuts can be **pinned** as dashed
+   overlays to compare frequencies, shadings or algorithms. No engine change —
+   the map data is already client-side.
 3. **Array A/B comparison + PDF report.** Two config snapshots computed and shown
    side-by-side with a metrics diff (optionally on a shared dB reference via R2).
    Report via print-to-PDF: a clean report DOM (config tables, embedded map PNGs,

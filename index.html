@@ -283,6 +283,11 @@
             <input type="checkbox" id="lines" checked />
             <span>Contour lines</span>
           </label>
+          <label class="check">
+            <input type="checkbox" id="cut" />
+            <span>1-D line cut</span>
+          </label>
+          <p class="hint">Cuts through the peak along u and v. "Pin" keeps a cut on the chart so you can compare settings.</p>
         </section>
 
         <section class="group">
@@ -340,6 +345,13 @@
         </div>
         <div id="plot" class="canvas-host"></div>
         <div class="cursor-readout" id="psf-readout" hidden></div>
+        <div class="cut-panel" id="cut-panel">
+          <div class="cut-tools">
+            <button class="tool-btn" id="cut-pin" title="Pin these cuts for comparison">Pin</button>
+            <button class="tool-btn" id="cut-clear" title="Clear pinned cuts">Clear</button>
+          </div>
+          <div class="chart-host" id="chart-cut"></div>
+        </div>
       </main>
 
       <!-- ───────────────────────── metrics ───────────────────────── -->

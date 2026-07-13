@@ -53,6 +53,7 @@ const state = {
   dyn: 30,
   levels: 10,
   lines: true,
+  cut: false,
   colormap: "turbo",
   // source marker (primary source)
   srcPos: [0, 0, 1],
@@ -590,6 +591,7 @@ function drawPlot(res) {
     sources: sourcesInPlane(state.fplane),
   });
   $("psf-plane").textContent = " · " + state.fplane + (band ? " · band average" : "");
+  renderCut();
 }
 
 // Render a PSF result into an offscreen canvas and push the texture to geo
@@ -825,6 +827,82 @@ $("sweep-overlay").addEventListener("click", (e) => {
 });
 $("sweep-csv").addEventListener("click", exportSweepCsv);
 
+// ───────────────────────── 1-D line cut ─────────────────────────
+// Optional (off by default, zero layout cost when off). Cuts run through the
+// map's peak along u and v. Pinned cuts stay on the chart as dashed overlays so
+// the user can compare frequencies, shadings or algorithms against each other.
+let chartCut = null;
+let pinnedCuts = []; // in-memory only — derived data, never persisted
+
+function cutLabel() {
+  const alg = state.algorithm === "functional" ? `func ν${state.nu}` : "conv";
+  return `${fmtFreq(state.frequency)} · ${state.shading} · ${alg}`;
+}
+
+function currentCuts() {
+  const res = lastResults[state.fplane];
+  if (!res || !state.cut) return null;
+  const pk = plot.peakUV();
+  if (!pk) return null;
+  const uMin = res.u[0], uMax = res.u[res.nx - 1];
+  const vMin = res.v[0], vMax = res.v[res.ny - 1];
+  // Clamp to the display's dynamic range: raw nulls run to −300 dB and would
+  // otherwise collapse the chart's y scale.
+  const clamp = (pts) => pts.map(([s, db]) => [s, isFinite(db) ? Math.max(-state.dyn, db) : NaN]);
+  return {
+    u: clamp(plot.sampleLine(uMin, pk.v, uMax, pk.v)),
+    v: clamp(plot.sampleLine(pk.u, vMin, pk.u, vMax)),
+  };
+}
+
+function renderCut() {
+  if (!state.cut) return;
+  if (!chartCut) chartCut = new LineChart($("chart-cut"));
+  const cur = currentCuts();
+  if (!cur) return;
+
+  const series = [];
+  pinnedCuts.forEach((pin, i) => {
+    const c = CHART_PALETTE[(i + 2) % CHART_PALETTE.length];
+    series.push({ label: `${pin.label} u`, color: c, points: pin.u, dashed: true });
+    series.push({ label: `${pin.label} v`, color: c, points: pin.v, dashed: true });
+  });
+  series.push({ label: "u", color: CHART_PALETTE[0], points: cur.u });
+  series.push({ label: "v", color: CHART_PALETTE[1], points: cur.v });
+
+  chartCut.render({
+    series,
+    xLabel: "position through peak (m)",
+    yLabel: "level (dB)",
+    xLog: false,
+    hLines: [{ y: -3, label: "−3 dB" }],
+    xFormat: (v) => v.toFixed(2),
+    yFormat: (v) => v.toFixed(0),
+  });
+}
+
+function setCutEnabled(on) {
+  state.cut = on;
+  document.querySelector(".stage-psf").classList.toggle("with-cut", on);
+  if (on) renderCut();
+}
+
+$("cut").addEventListener("change", (e) => setCutEnabled(e.target.checked));
+$("cut-pin").addEventListener("click", () => {
+  const cur = currentCuts();
+  if (!cur) {
+    toast("Nothing to pin yet.");
+    return;
+  }
+  if (pinnedCuts.length >= 3) pinnedCuts.shift(); // keep the chart readable
+  pinnedCuts.push({ label: cutLabel(), u: cur.u, v: cur.v });
+  renderCut();
+});
+$("cut-clear").addEventListener("click", () => {
+  pinnedCuts = [];
+  renderCut();
+});
+
 // ───────────────────────── cursor readout ─────────────────────────
 (function bindReadout() {
   const host = $("plot");
@@ -903,6 +981,8 @@ function syncAllControls() {
   $("noise-enable").checked = state.noiseEnabled;
   $("noise-field").hidden = !state.noiseEnabled;
   $("lines").checked = state.lines;
+  $("cut").checked = state.cut;
+  setCutEnabled(state.cut);
 
   $("sweep-fmin").value = state.sweepFmin;
   $("sweep-fmax").value = state.sweepFmax;
