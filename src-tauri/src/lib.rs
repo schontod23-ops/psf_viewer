@@ -21,6 +21,10 @@ pub struct ComputeRequest {
     steering: SteeringFormulation,
     #[serde(default)]
     diag_removal: bool,
+    /// Per-sensor white-noise variance σ² (0 = off). Adds an optional sensor
+    /// noise floor to the beamformer output.
+    #[serde(default)]
+    noise_power: f64,
 }
 
 #[derive(Serialize)]
@@ -50,6 +54,7 @@ fn compute(req: ComputeRequest) -> Result<ComputeResponse, String> {
         req.speed_of_sound,
         req.steering,
         req.diag_removal,
+        req.noise_power,
     )?;
     let metrics = compute_metrics(&array, &grid, &values, req.speed_of_sound);
     Ok(ComputeResponse {

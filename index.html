@@ -233,7 +233,16 @@
           </div>
           <label class="check">
             <input type="checkbox" id="diag-removal" />
-            <span>Diagonal removal (CSM)</span>
+            <span>Diagonal removal (autopower)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="noise-enable" />
+            <span>Sensor noise floor</span>
+          </label>
+          <label class="field" id="noise-field" hidden>
+            <span>Noise level <em id="lab-noise">−40 dB</em></span>
+            <input type="range" id="noise" min="-80" max="0" step="1" value="-40" />
+            <p class="hint">Per-sensor white noise, σ² = 10^(dB/10). Diagonal removal cancels it.</p>
           </label>
         </section>
 

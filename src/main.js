@@ -43,6 +43,9 @@ const state = {
   shading: "uniform",
   steering: "I",
   diagRemoval: false,
+  // optional white sensor-noise floor: σ² = 10^(noiseDb/10) when enabled
+  noiseEnabled: false,
+  noiseDb: -40,
   dyn: 30,
   levels: 10,
   lines: true,
@@ -109,6 +112,7 @@ bindSlider("dx", "dx", (v) => `${v.toFixed(3)} m`);
 bindSlider("frequency", "frequency", (v) => `${v | 0} Hz`);
 bindSlider("dyn", "dyn", (v) => `${v | 0} dB`);
 bindSlider("levels", "levels", (v) => `${v | 0}`);
+bindSlider("noise", "noiseDb", (v) => `${v | 0} dB`);
 
 // ───────────────────────── slider bounds settings ─────────────────────────
 // Per-slider min/max/step, editable at runtime and persisted so users can
@@ -335,6 +339,12 @@ $("diag-removal").addEventListener("change", (e) => {
   schedule();
 });
 
+$("noise-enable").addEventListener("change", (e) => {
+  state.noiseEnabled = e.target.checked;
+  $("noise-field").hidden = !state.noiseEnabled;
+  schedule();
+});
+
 $("lines").addEventListener("change", (e) => {
   state.lines = e.target.checked;
   if (lastResults.xy) drawPlot(lastResults[state.fplane] || lastResults.xy);
@@ -435,6 +445,8 @@ function buildRequest(planeName) {
     shading: state.shading,
     steering: state.steering,
     diag_removal: state.diagRemoval,
+    // σ² per sensor; 0 disables the noise floor entirely.
+    noise_power: state.noiseEnabled ? Math.pow(10, state.noiseDb / 10) : 0,
   };
 }
 
@@ -582,7 +594,7 @@ function exportCsv() {
   const lines = [];
   lines.push(`# PSF Array Viewer export`);
   lines.push(`# plane=${state.fplane} frequency_Hz=${state.frequency} speed_of_sound_m_s=${state.c}`);
-  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval}`);
+  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval} noise_dB=${state.noiseEnabled ? state.noiseDb : "off"}`);
   lines.push(`# source_m=[${state.srcPos.join(",")}] grid=${res.nx}x${res.ny}`);
   lines.push(`${au}_m,${av}_m,level_dB`);
   for (let j = 0; j < res.ny; j++) {
@@ -642,7 +654,7 @@ function syncAllControls() {
   const sliderMap = {
     n: "n", diameter: "diameter", "ring-n": "ringN", "ring-diameter": "ringDiameter",
     "grid-pitch": "gridPitch", "cross-n": "crossN", "cross-length": "crossLength",
-    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels",
+    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels", noise: "noiseDb",
   };
   for (const id in sliderMap) {
     const setter = sliderSetters[id];
@@ -676,6 +688,8 @@ function syncAllControls() {
   $("raytrace").checked = state.raytrace;
   $("rt-badge").hidden = !state.raytrace;
   $("diag-removal").checked = state.diagRemoval;
+  $("noise-enable").checked = state.noiseEnabled;
+  $("noise-field").hidden = !state.noiseEnabled;
   $("lines").checked = state.lines;
   if (state.csvName) $("csv-status").textContent = `Loaded ${state.csvName}`;
 
@@ -897,33 +911,31 @@ function jsCompute(req) {
   const reference = centroid(arr.pos);
   const formulation = req.steering || "I";
   const diagRemoval  = !!req.diag_removal;
+  const noise        = Math.max(0, req.noise_power || 0);   // σ² per sensor
   const sources = (req.sources && req.sources.length)
     ? req.sources
     : [{ pos: req.source || f.center, amplitude: 1 }];
   const nsrc = sources.length;
 
-  // Free-field pressure at each mic from each source (p[mi][s]) and the CSM
-  // diagonal Cmm[mi] = Σ_s |p_{s,mi}|².
-  const p = [], cmm = [];
+  // Free-field complex pressure at each mic from each source (p[mi][s] = gₛ at
+  // mic mi). Only this propagation vector is needed — no cross-spectral matrix
+  // (or its diagonal) is ever formed.
+  const p = [];
   for (let mi = 0; mi < arr.pos.length; mi++) {
     const row = [];
-    let diag = 0;
     for (let s = 0; s < nsrc; s++) {
       const d = Math.max(1e-9, vdist(arr.pos[mi], sources[s].pos));
       const ph = -k * d;
       const a = sources[s].amplitude;
-      const pr = a * Math.cos(ph) / d, pi = a * Math.sin(ph) / d;
-      row.push([pr, pi]);
-      diag += pr * pr + pi * pi;
+      row.push([a * Math.cos(ph) / d, a * Math.sin(ph) / d]);
     }
     p.push(row);
-    cmm.push(diag);
   }
 
   const wsum = weights.reduce((a, b) => a + b, 0);
   const wsumSafe = Math.abs(wsum) < 1e-30 ? 1 : wsum;
   const needsNormPass = formulation === "III" || formulation === "IV";
-  const sRe = new Float64Array(nsrc), sIm = new Float64Array(nsrc);
+  const sRe = new Float64Array(nsrc), sIm = new Float64Array(nsrc), sDiag = new Float64Array(nsrc);
 
   const raw = new Float64Array(g.nx * g.ny);
   for (let j = 0; j < g.ny; j++) {
@@ -949,7 +961,8 @@ function jsCompute(req) {
 
       sRe.fill(0);
       sIm.fill(0);
-      let diagSum = 0;
+      if (diagRemoval) sDiag.fill(0);
+      let hNorm2 = 0;   // Σ_m |h_m|² — array response to white sensor noise
       for (let mi = 0; mi < arr.pos.length; mi++) {
         const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
         const gm = r0 / rm;
@@ -961,17 +974,29 @@ function jsCompute(req) {
         else { yRe = c; yIm = s; }
         const hRe = weights[mi] * yRe * invNorm;
         const hIm = weights[mi] * yIm * invNorm;
+        const hMag2 = hRe * hRe + hIm * hIm;
+        hNorm2 += hMag2;
         const prow = p[mi];
         for (let s2 = 0; s2 < nsrc; s2++) {
           const pRe = prow[s2][0], pIm = prow[s2][1];
           sRe[s2] += hRe * pRe + hIm * pIm;
           sIm[s2] += hRe * pIm - hIm * pRe;
+          if (diagRemoval) sDiag[s2] += hMag2 * (pRe * pRe + pIm * pIm);
         }
-        if (diagRemoval) diagSum += (hRe * hRe + hIm * hIm) * cmm[mi];
       }
+      // Incoherent sum of per-source powers, each with its own autopower
+      // (diagonal) term removed when requested — no CSM is materialised.
       let power = 0;
-      for (let s2 = 0; s2 < nsrc; s2++) power += sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
-      if (diagRemoval) power -= diagSum;
+      for (let s2 = 0; s2 < nsrc; s2++) {
+        let ps = sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
+        if (diagRemoval) ps -= sDiag[s2];
+        power += ps;
+      }
+      // White sensor-noise floor σ²·Σ_m|h_m|² — added to the output, and
+      // stripped again by diagonal removal (which is why DR rejects it).
+      const noiseContrib = noise * hNorm2;
+      power += noiseContrib;
+      if (diagRemoval) power -= noiseContrib;
       raw[j * g.nx + i] = Math.max(0, power);
     }
   }
