@@ -328,6 +328,16 @@ input[type="number"]:focus, .file-btn:focus-visible {
   transition: color 0.25s var(--ease), border-color 0.25s var(--ease);
 }
 .tool-btn:hover { color: var(--accent); border-color: var(--accent); }
+.cursor-readout {
+  position: absolute; bottom: 10px; left: 12px; z-index: 4;
+  pointer-events: none;
+  background: rgba(8, 12, 19, 0.78);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  color: var(--ink); font-family: var(--font-mono);
+  font-size: 11px; letter-spacing: 0.3px; padding: 5px 9px;
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+}
 .canvas-host { position: absolute; inset: 0; }
 .stage-3d .canvas-host { cursor: grab; }
 .stage-3d .canvas-host:active { cursor: grabbing; }

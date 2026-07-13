@@ -602,6 +602,23 @@ function planeAxesLabels(label) {
 $("export-png").addEventListener("click", exportPng);
 $("export-csv").addEventListener("click", exportCsv);
 
+// ───────────────────────── cursor readout ─────────────────────────
+(function bindReadout() {
+  const host = $("plot");
+  const readout = $("psf-readout");
+  host.addEventListener("mousemove", (e) => {
+    const r = plot.valueAt(e.clientX, e.clientY);
+    if (!r) {
+      readout.hidden = true;
+      return;
+    }
+    const [au, av] = planeAxesLabels(state.fplane);
+    readout.hidden = false;
+    readout.textContent = `${au} ${r.u.toFixed(3)}  ${av} ${r.v.toFixed(3)} m   ${r.db.toFixed(1)} dB`;
+  });
+  host.addEventListener("mouseleave", () => { readout.hidden = true; });
+})();
+
 // ───────────────────────── save / load configuration ─────────────────────────
 function currentConfig() {
   return { app: "psf-array-viewer", version: 1, state: JSON.parse(JSON.stringify(state)) };

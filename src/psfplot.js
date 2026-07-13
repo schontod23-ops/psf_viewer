@@ -70,6 +70,24 @@ export class PSFPlot {
     if (this.last) this.render(this.last, false);
   }
 
+  // Map a viewport pointer position to {u, v, db} at the nearest grid cell,
+  // or null if the pointer is outside the map rectangle.
+  valueAt(clientX, clientY) {
+    if (!this.mapGeom || !this.last) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return null;
+    const px = (clientX - rect.left) * (this.canvas.width / rect.width);
+    const py = (clientY - rect.top) * (this.canvas.height / rect.height);
+    const { ox, oy, mapW, mapH } = this.mapGeom;
+    if (px < ox || px > ox + mapW || py < oy || py > oy + mapH) return null;
+    const { nx, ny, u, v, values } = this.last;
+    const fx = (px - ox) / mapW; // 0..1 along u
+    const fy = 1 - (py - oy) / mapH; // 0..1 along v (flip: +v up)
+    const i = Math.max(0, Math.min(nx - 1, Math.round(fx * (nx - 1))));
+    const j = Math.max(0, Math.min(ny - 1, Math.round(fy * (ny - 1))));
+    return { u: u[i], v: v[j], db: values[j * nx + i] };
+  }
+
   // args: {values, nx, ny, u, v, dynamicDb, levels, showLines, planeLabel}
   render(args, animate = true) {
     this.last = args;
@@ -96,6 +114,9 @@ export class PSFPlot {
     else mapH = pw / dataAspect;
     const ox = m.l + (pw - mapW) / 2;
     const oy = m.t + (ph - mapH) / 2;
+    // Remember the map rectangle (device px) so pointer hits can be mapped
+    // back to data coordinates in valueAt().
+    this.mapGeom = { ox, oy, mapW, mapH };
 
     // clamp values into [-dyn, 0]
     const clamped = new Float64Array(values.length);
