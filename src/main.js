@@ -63,6 +63,10 @@ const state = {
   // 3D options
   multiplane: false,
   raytrace: false,
+  // STL model (the geometry itself is not persisted — only how to interpret it)
+  stlName: null,
+  stlScale: 1,
+  stlPsf: false,
   // broadband sweep
   sweepFmin: 1000,
   sweepFmax: 10000,
@@ -671,6 +675,98 @@ function planeAxesLabels(label) {
 $("export-png").addEventListener("click", exportPng);
 $("export-csv").addEventListener("click", exportCsv);
 
+// ───────────────────────── STL model + surface PSF ─────────────────────────
+// The model is parsed client-side (three.js STLLoader). Painting the PSF onto it
+// beamforms the mesh's surface samples through the same engine core the map uses
+// (compute_on_points / beamformPointsJS), so map and model always agree.
+const SURFACE_BUDGET = 4000;
+let stlBuffer = null;   // kept so a units-scale change can re-parse
+let stlSample = null;   // { points, stride, total } from the last load
+
+function showStlControls(on) {
+  document.querySelectorAll("[data-when-stl]").forEach((el) => (el.hidden = !on));
+  $("stl-run").hidden = !(on && state.stlPsf);
+}
+
+function loadStlBuffer(buffer, scale) {
+  const count = geo.loadSTL(buffer, scale);
+  stlSample = geo.surfacePoints(SURFACE_BUDGET);
+  $("stl-status").textContent =
+    `${state.stlName || "model"} · ${count.toLocaleString()} vertices · ${stlSample.points.length.toLocaleString()} samples`;
+  showStlControls(true);
+  if (state.stlPsf) runSurfacePsf();
+}
+
+async function runSurfacePsf() {
+  if (!stlSample || !state.stlPsf) return;
+  const btn = $("stl-run");
+  btn.disabled = true;
+  btn.textContent = "Evaluating…";
+  try {
+    const req = {
+      array: buildArrayDescriptor(),
+      sources: activeSources(),
+      points: stlSample.points,
+      frequency: state.frequency,
+      physics: buildPhysics(),
+    };
+    const inv = await getInvoke();
+    const res = inv ? await inv("compute_on_points", { req }) : jsComputeOnPoints(req);
+    geo.setSurfaceLevels(res.values, stlSample.stride, state.dyn, state.colormap);
+  } catch (e) {
+    toast(typeof e === "string" ? e : e.message || "Surface evaluation failed.");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Evaluate surface";
+  }
+}
+
+$("stl-btn").addEventListener("click", () => $("stl-input").click());
+$("stl-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      stlBuffer = reader.result;
+      state.stlName = file.name;
+      loadStlBuffer(stlBuffer, state.stlScale);
+    } catch {
+      toast("Could not parse that STL.");
+    }
+  };
+  reader.onerror = () => toast("Could not read that file.");
+  reader.readAsArrayBuffer(file);
+  e.target.value = "";
+});
+
+$("stl-clear").addEventListener("click", () => {
+  geo.clearSTL();
+  stlBuffer = null;
+  stlSample = null;
+  state.stlName = null;
+  state.stlPsf = false;
+  $("stl-psf").checked = false;
+  $("stl-status").textContent = "Optional. The PSF can be painted onto the model's surface.";
+  showStlControls(false);
+});
+
+$("stl-scale").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (!(v > 0) || !stlBuffer) return;
+  state.stlScale = v;
+  loadStlBuffer(stlBuffer, v);   // re-parse: geometry.scale() is not reversible
+});
+
+$("stl-psf").addEventListener("change", (e) => {
+  state.stlPsf = e.target.checked;
+  $("stl-run").hidden = !state.stlPsf;
+  if (state.stlPsf) runSurfacePsf();
+  else geo.clearSurfaceLevels();
+});
+
+$("stl-run").addEventListener("click", runSurfacePsf);
+
 // ───────────────────────── frequency sweep ─────────────────────────
 // A sweep is far too costly to run on every slider nudge, so it is explicit:
 // the user presses "Run sweep". Results feed two charts and, optionally, a
@@ -977,6 +1073,14 @@ function syncAllControls() {
   $("multiplane").checked = state.multiplane;
   $("raytrace").checked = state.raytrace;
   $("rt-badge").hidden = !state.raytrace;
+
+  // The STL geometry itself is never persisted (only the units scale), so a
+  // restored session always starts without a model loaded.
+  state.stlName = null;
+  state.stlPsf = false;
+  $("stl-psf").checked = false;
+  $("stl-scale").value = state.stlScale;
+  showStlControls(false);
   $("diag-removal").checked = state.diagRemoval;
   $("noise-enable").checked = state.noiseEnabled;
   $("noise-field").hidden = !state.noiseEnabled;
@@ -1263,13 +1367,12 @@ function hermitianEig(aIn, n) {
 //   II  (inverse):       h_m = 1 / conj(x_m)
 //   III (true level):    h_m = x_m / Σ w_m|x_m|²
 //   IV  (true location): h_m = x_m / sqrt(Σw_m * Σ w_m|x_m|²)
-function jsCompute(req) {
-  const phys      = req.physics || {};
-  const arr       = buildArrayJS(req);
-  const weights   = weightsForJS(arr, phys.shading);
-  const f         = req.focus;
-  const g         = gridJS(f);
-  const k         = (2 * Math.PI * req.frequency) / phys.speed_of_sound;
+// Beamform an arbitrary point cloud → raw (un-normalised) linear power.
+// This is the JS mirror of psf_core::compute_at_points (roadmap R1/R2): the grid
+// map and the STL surface map both run through it, so the two engines and the two
+// scan geometries can never drift apart.
+function beamformPointsJS(arr, weights, points, sources, phys, frequency) {
+  const k         = (2 * Math.PI * frequency) / phys.speed_of_sound;
   const reference = centroid(arr.pos);
   const formulation = phys.steering || "I";
   const noise        = Math.max(0, phys.noise_power || 0);   // σ² per sensor
@@ -1278,9 +1381,6 @@ function jsCompute(req) {
   // Diagonal removal is conventional-only — functional reaches C through its
   // low-rank eigenpairs, where there is no materialised diagonal to strip.
   const diagRemoval  = !!phys.diag_removal && !isFunctional;
-  const sources = (req.sources && req.sources.length)
-    ? req.sources
-    : [{ pos: req.source || f.center, amplitude: 1 }];
   const nsrc = sources.length;
 
   // Free-field complex pressure at each mic from each source (p[mi][s] = gₛ at
@@ -1327,96 +1427,131 @@ function jsCompute(req) {
     ft = { nu, base, coef, v, n: nsrc };
   }
 
-  const raw = new Float64Array(g.nx * g.ny);
-  for (let j = 0; j < g.ny; j++) {
-    for (let i = 0; i < g.nx; i++) {
-      const pt = vadd(f.center, vadd(vscale(g.uh, g.u[i]), vscale(g.vh, g.v[j])));
-      const r0 = Math.max(1e-9, vdist(reference, pt));
+  const raw = new Float64Array(points.length);
+  for (let idx = 0; idx < points.length; idx++) {
+    const pt = points[idx];
+    const r0 = Math.max(1e-9, vdist(reference, pt));
 
-      let normSqSum = 1;
-      if (needsNormPass) {
-        let s = 0;
-        for (let mi = 0; mi < arr.pos.length; mi++) {
-          const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
-          const gm = r0 / rm;
-          s += weights[mi] * gm * gm;
-        }
-        normSqSum = Math.abs(s) < 1e-30 ? 1 : s;
-      }
-      let norm;
-      if (formulation === "III") norm = normSqSum;
-      else if (formulation === "IV") norm = Math.sqrt(Math.max(0, wsumSafe) * normSqSum);
-      else norm = wsumSafe;
-      const invNorm = Math.abs(norm) < 1e-30 ? 1 : 1 / norm;
-
-      sRe.fill(0);
-      sIm.fill(0);
-      if (diagRemoval) sDiag.fill(0);
-      let hNorm2 = 0;   // Σ_m |h_m|² — array response to white sensor noise
+    let normSqSum = 1;
+    if (needsNormPass) {
+      let s = 0;
       for (let mi = 0; mi < arr.pos.length; mi++) {
         const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
         const gm = r0 / rm;
-        const ph = -k * (rm - r0);
-        const c = Math.cos(ph), s = Math.sin(ph);
-        let yRe, yIm;
-        if (formulation === "II") { yRe = c / gm; yIm = s / gm; }
-        else if (formulation === "III" || formulation === "IV") { yRe = gm * c; yIm = gm * s; }
-        else { yRe = c; yIm = s; }
-        const hRe = weights[mi] * yRe * invNorm;
-        const hIm = weights[mi] * yIm * invNorm;
-        const hMag2 = hRe * hRe + hIm * hIm;
-        hNorm2 += hMag2;
-        const prow = p[mi];
-        for (let s2 = 0; s2 < nsrc; s2++) {
-          const pRe = prow[s2][0], pIm = prow[s2][1];
-          sRe[s2] += hRe * pRe + hIm * pIm;
-          sIm[s2] += hRe * pIm - hIm * pRe;
-          if (diagRemoval) sDiag[s2] += hMag2 * (pRe * pRe + pIm * pIm);
-        }
+        s += weights[mi] * gm * gm;
       }
-      let power;
-      if (ft) {
-        // Functional: P = (hᴴC^{1/ν}h)^ν, from the projections already in hand.
-        let acc = ft.base * hNorm2;
-        for (let idx = 0; idx < ft.n; idx++) {
-          let z = [0, 0];
-          for (let s2 = 0; s2 < ft.n; s2++) {
-            z = cadd(z, cmul(ft.v[s2 * ft.n + idx], [sRe[s2], sIm[s2]]));
-          }
-          acc += ft.coef[idx] * (z[0] * z[0] + z[1] * z[1]);
-        }
-        power = Math.pow(Math.max(0, acc), ft.nu);
-      } else {
-        // Conventional: incoherent sum of per-source powers, each with its own
-        // autopower (diagonal) term removed when requested — no CSM materialised.
-        power = 0;
-        for (let s2 = 0; s2 < nsrc; s2++) {
-          let ps = sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
-          if (diagRemoval) ps -= sDiag[s2];
-          power += ps;
-        }
-        // White sensor-noise floor σ²·Σ_m|h_m|² — added to the output, and
-        // stripped again by diagonal removal (which is why DR rejects it).
-        const noiseContrib = noise * hNorm2;
-        power += noiseContrib;
-        if (diagRemoval) power -= noiseContrib;
+      normSqSum = Math.abs(s) < 1e-30 ? 1 : s;
+    }
+    let norm;
+    if (formulation === "III") norm = normSqSum;
+    else if (formulation === "IV") norm = Math.sqrt(Math.max(0, wsumSafe) * normSqSum);
+    else norm = wsumSafe;
+    const invNorm = Math.abs(norm) < 1e-30 ? 1 : 1 / norm;
+
+    sRe.fill(0);
+    sIm.fill(0);
+    if (diagRemoval) sDiag.fill(0);
+    let hNorm2 = 0;   // Σ_m |h_m|² — array response to white sensor noise
+    for (let mi = 0; mi < arr.pos.length; mi++) {
+      const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
+      const gm = r0 / rm;
+      const ph = -k * (rm - r0);
+      const c = Math.cos(ph), s = Math.sin(ph);
+      let yRe, yIm;
+      if (formulation === "II") { yRe = c / gm; yIm = s / gm; }
+      else if (formulation === "III" || formulation === "IV") { yRe = gm * c; yIm = gm * s; }
+      else { yRe = c; yIm = s; }
+      const hRe = weights[mi] * yRe * invNorm;
+      const hIm = weights[mi] * yIm * invNorm;
+      const hMag2 = hRe * hRe + hIm * hIm;
+      hNorm2 += hMag2;
+      const prow = p[mi];
+      for (let s2 = 0; s2 < nsrc; s2++) {
+        const pRe = prow[s2][0], pIm = prow[s2][1];
+        sRe[s2] += hRe * pRe + hIm * pIm;
+        sIm[s2] += hRe * pIm - hIm * pRe;
+        if (diagRemoval) sDiag[s2] += hMag2 * (pRe * pRe + pIm * pIm);
       }
-      raw[j * g.nx + i] = Math.max(0, power);
+    }
+
+    let power;
+    if (ft) {
+      // Functional: P = (hᴴC^{1/ν}h)^ν, from the projections already in hand.
+      let acc = ft.base * hNorm2;
+      for (let i2 = 0; i2 < ft.n; i2++) {
+        let z = [0, 0];
+        for (let s2 = 0; s2 < ft.n; s2++) {
+          z = cadd(z, cmul(ft.v[s2 * ft.n + i2], [sRe[s2], sIm[s2]]));
+        }
+        acc += ft.coef[i2] * (z[0] * z[0] + z[1] * z[1]);
+      }
+      power = Math.pow(Math.max(0, acc), ft.nu);
+    } else {
+      // Conventional: incoherent sum of per-source powers, each with its own
+      // autopower (diagonal) term removed when requested — no CSM materialised.
+      power = 0;
+      for (let s2 = 0; s2 < nsrc; s2++) {
+        let ps = sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
+        if (diagRemoval) ps -= sDiag[s2];
+        power += ps;
+      }
+      // White sensor-noise floor σ²·Σ_m|h_m|² — added to the output, and
+      // stripped again by diagonal removal (which is why DR rejects it).
+      const noiseContrib = noise * hNorm2;
+      power += noiseContrib;
+      if (diagRemoval) power -= noiseContrib;
+    }
+    raw[idx] = Math.max(0, power);
+  }
+
+  return raw;
+}
+
+// Mirrors psf_core::normalize_to_db — peak-referenced dB, floored at −300.
+function normalizeToDbJS(raw) {
+  let p0 = 1e-30;
+  for (let i = 0; i < raw.length; i++) if (raw[i] > p0) p0 = raw[i];
+  const out = new Float32Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = Math.max(-300, 10 * Math.log10(raw[i] / p0 + 1e-30));
+  }
+  return out;
+}
+
+function jsCompute(req) {
+  const phys    = req.physics || {};
+  const arr     = buildArrayJS(req);
+  const weights = weightsForJS(arr, phys.shading);
+  const f       = req.focus;
+  const g       = gridJS(f);
+  const sources = (req.sources && req.sources.length)
+    ? req.sources
+    : [{ pos: f.center, amplitude: 1 }];
+
+  // Grid scan points, row-major (v outer, u inner).
+  const points = [];
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) {
+      points.push(vadd(f.center, vadd(vscale(g.uh, g.u[i]), vscale(g.vh, g.v[j]))));
     }
   }
 
-  // Normalise to the grid's own peak — the source (and thus the peak) need
-  // not sit at the grid's geometric centre.
-  const p0 = Math.max(1e-30, raw.reduce((a, b) => Math.max(a, b), 0));
-  const values = new Float32Array(g.nx * g.ny);
-  for (let idx = 0; idx < raw.length; idx++) {
-    values[idx] = Math.max(-300, 10 * Math.log10(raw[idx] / p0 + 1e-30));
-  }
-
+  const raw = beamformPointsJS(arr, weights, points, sources, phys, req.frequency);
+  const values = normalizeToDbJS(raw);
   const metrics = metricsJS(arr, g, values, phys.speed_of_sound);
-  // `raw` (un-normalised linear power) is returned alongside the dB map so a
-  // sweep can band-average in the power domain before normalising once.
+  // `raw` (un-normalised linear power) rides along so a sweep can band-average in
+  // the power domain before normalising once.
   return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, raw, metrics };
+}
+
+// Mirrors the compute_on_points Tauri command — beamform an explicit point cloud
+// (the surface samples of a loaded STL model).
+function jsComputeOnPoints(req) {
+  const phys    = req.physics || {};
+  const arr     = buildArrayJS(req);
+  const weights = weightsForJS(arr, phys.shading);
+  const raw = beamformPointsJS(arr, weights, req.points, req.sources, phys, req.frequency);
+  return { values: normalizeToDbJS(raw) };
 }
 
 // Mirrors psf_core::sweep_frequencies.

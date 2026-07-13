@@ -37,10 +37,11 @@ change lands in both engines** unless a feature is explicitly native-only.
   returns **raw linear power**; `normalize_to_db` converts to peak-referenced dB.
   Lets callers combine maps before normalizing (band-averaging, shared-reference
   A/B, noise floor).
-- **R3 — shared modules** *(partly done)*: `src/linechart.js` is the small
-  dependency-free canvas line-chart component — used by the sweep charts now, and
-  reused by the line-cut (2) and A/B overlay (3). Still to do: a colormap-LUT
-  module shared by `psfplot.js` and 3-D mesh coloring (task 4).
+- **R3 — shared modules** *(done)*: `src/linechart.js` is the small dependency-free
+  canvas line chart (sweep charts, line-cut, and the A/B overlay all use it).
+  `src/colormap.js` is the single source of truth for the colour ramps — used by
+  the 2-D contour renderer and by the 3-D mesh colouring, so a map and a model
+  painted from it always agree.
 
 ## Feature tasks
 
@@ -61,10 +62,13 @@ change lands in both engines** unless a feature is explicitly native-only.
    side-by-side with a metrics diff (optionally on a shared dB reference via R2).
    Report via print-to-PDF: a clean report DOM (config tables, embedded map PNGs,
    metrics, optional charts, notes) + `window.print()`.
-4. **Loadable STL, PSF on surface points.** Parse STL client-side (three.js
-   `STLLoader`), sample surface points down to a budget, beamform them via R1
-   (`compute_on_points`), color per-vertex with the shared colormap LUT (R3).
-   Gated behind a button (per-point evaluation is costly).
+4. **Loadable STL, PSF on surface points.** *(done)* The STL is parsed client-side
+   (three.js `STLLoader`) with a units→metres scale. Its surface vertices are
+   thinned to a 4000-point budget and beamformed through the R1 point-cloud core
+   (`compute_on_points` natively, `beamformPointsJS` in the web preview), then
+   painted back as per-vertex colours using the shared colormap LUT (R3). Gated
+   behind an explicit "Evaluate surface" button, since per-point evaluation is
+   costly. The mesh itself is not persisted — only the units scale.
 5. **Mic selection/move editor.** 2-D top-down editor: click / Ctrl+click /
    rectangle-marquee selection, drag to move, arrow-key nudge, snap, undo/redo.
    Editing converts the working array into a `Manual { pos, weights }` source.

@@ -197,6 +197,25 @@
             <input type="checkbox" id="raytrace" />
             <span>Path tracing<span class="hint" style="display:inline;margin:0 0 0 6px;font-size:9.5px">(progressive)</span></span>
           </label>
+
+          <div class="field" style="margin-top:14px">
+            <span>3-D model (STL)</span>
+            <button class="file-btn" id="stl-btn">Load STL…</button>
+            <input type="file" id="stl-input" accept=".stl" hidden />
+            <p class="hint" id="stl-status">Optional. The PSF can be painted onto the model's surface.</p>
+          </div>
+          <div data-when-stl hidden>
+            <div class="field grid2">
+              <label><span>Units → m</span><input type="number" id="stl-scale" value="1" min="0.0001" step="0.001" /></label>
+              <label><span>&nbsp;</span><button class="file-btn" id="stl-clear">Remove</button></label>
+            </div>
+            <label class="check">
+              <input type="checkbox" id="stl-psf" />
+              <span>Paint PSF on surface</span>
+            </label>
+            <button class="file-btn" id="stl-run" style="margin-top:10px" hidden>Evaluate surface</button>
+            <p class="hint">Evaluated at up to 4000 surface samples — press Evaluate after changing the setup.</p>
+          </div>
         </section>
 
         <section class="group">

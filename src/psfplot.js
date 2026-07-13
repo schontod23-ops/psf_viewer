@@ -4,27 +4,7 @@
 // square texture (map only) for the 3-D focus plane.
 
 import { contours as d3contours } from "d3-contour";
-import {
-  interpolateTurbo,
-  interpolateViridis,
-  interpolateMagma,
-  interpolateInferno,
-  interpolateCividis,
-  interpolateGreys,
-} from "d3-scale-chromatic";
-
-// Available PSF colormaps, keyed by the value used in the UI/state.
-const COLORMAPS = {
-  turbo: interpolateTurbo,
-  viridis: interpolateViridis,
-  magma: interpolateMagma,
-  inferno: interpolateInferno,
-  cividis: interpolateCividis,
-  greys: interpolateGreys,
-};
-function interpFor(name) {
-  return COLORMAPS[name] || interpolateTurbo;
-}
+import { interpFor } from "./colormap.js";
 
 const MONO = '11px "SF Mono","JetBrains Mono","Roboto Mono",ui-monospace,monospace';
 const INK = "#e7eef7";
