@@ -208,14 +208,19 @@
               <input type="number" id="frequency-num" class="slider-num" min="100" max="20000" step="50" value="5000" aria-label="frequency (Hz)" />
             </div>
           </label>
-          <label class="field grid2">
-            <span class="full">Speed of sound (m/s)</span>
+          <label class="field">
+            <span>Speed of sound (m/s)</span>
             <input type="number" id="c" value="343" min="1" step="1" />
-            <div class="seg sm" data-seg="shading">
+          </label>
+          <div class="field">
+            <span>Shading</span>
+            <div class="seg sm wrap" data-seg="shading">
               <button data-val="uniform" class="on">Uniform</button>
               <button data-val="hann">Hann</button>
+              <button data-val="hamming">Hamming</button>
+              <button data-val="blackman">Blackman</button>
             </div>
-          </label>
+          </div>
           <div class="field">
             <span>Steering vector <em id="lab-steering">Formulation I</em></span>
             <div class="seg sm" data-seg="steering">

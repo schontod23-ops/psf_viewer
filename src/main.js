@@ -818,12 +818,23 @@ function centroid(pos) {
   const s = pos.reduce((a,p) => vadd(a,p), [0,0,0]);
   return vscale(s, 1 / Math.max(1, pos.length));
 }
+// Radial window taper at normalised aperture radius rho — mirrors
+// Shading::taper in psf-core/src/lib.rs.
+function shadingTaper(shading, rho) {
+  const pi = Math.PI;
+  switch (shading) {
+    case "hann":     return 0.5 * (1 + Math.cos(pi * rho));
+    case "hamming":  return 0.54 + 0.46 * Math.cos(pi * rho);
+    case "blackman": return 0.42 + 0.5 * Math.cos(pi * rho) + 0.08 * Math.cos(2 * pi * rho);
+    default:         return 1;
+  }
+}
 function weightsForJS(arr, shading) {
   if (arr.weights) return arr.weights.slice();
-  if (shading === "hann") {
+  if (shading && shading !== "uniform") {
     const c = centroid(arr.pos);
     const rmax = Math.max(1e-12, ...arr.pos.map((p) => vdist(p, c)));
-    return arr.pos.map((p) => { const rho = Math.min(1, vdist(p,c)/rmax); return 0.5*(1+Math.cos(Math.PI*rho)); });
+    return arr.pos.map((p) => shadingTaper(shading, Math.min(1, vdist(p, c) / rmax)));
   }
   return arr.pos.map(() => 1);
 }

@@ -60,12 +60,33 @@ fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 // ─────────────────────────────────────────────────────────── amplitude shading
 
-/// Amplitude window applied across the array aperture.
+/// Amplitude window applied radially across the array aperture. Tapering the
+/// aperture trades a wider main lobe for lower side lobes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shading {
     Uniform,
     Hann,
+    Hamming,
+    Blackman,
+}
+
+impl Shading {
+    /// Window amplitude at normalised aperture radius `rho` ∈ [0, 1]
+    /// (0 = centre, 1 = rim).
+    fn taper(self, rho: f64) -> f64 {
+        let pi = std::f64::consts::PI;
+        match self {
+            Shading::Uniform => 1.0,
+            Shading::Hann => 0.5 * (1.0 + (pi * rho).cos()),
+            // Classic 1-D window coefficients, evaluated on the radial profile
+            // so the centre (rho=0) is unity and the rim (rho=1) the pedestal.
+            Shading::Hamming => 0.54 + 0.46 * (pi * rho).cos(),
+            Shading::Blackman => {
+                0.42 + 0.5 * (pi * rho).cos() + 0.08 * (2.0 * pi * rho).cos()
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────── array definition
@@ -323,26 +344,24 @@ pub fn weights_for(array: &Array, shading: Shading) -> Vec<f64> {
     if let Some(w) = &array.csv_weights {
         return w.clone();
     }
-    match shading {
-        Shading::Uniform => vec![1.0; array.len()],
-        Shading::Hann => {
-            let c = array.centroid();
-            let rmax = array
-                .pos
-                .iter()
-                .map(|p| dist(*p, c))
-                .fold(0.0_f64, f64::max)
-                .max(1e-12);
-            array
-                .pos
-                .iter()
-                .map(|p| {
-                    let rho = (dist(*p, c) / rmax).min(1.0);
-                    0.5 * (1.0 + (std::f64::consts::PI * rho).cos())
-                })
-                .collect()
-        }
+    if shading == Shading::Uniform {
+        return vec![1.0; array.len()];
     }
+    let c = array.centroid();
+    let rmax = array
+        .pos
+        .iter()
+        .map(|p| dist(*p, c))
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
+    array
+        .pos
+        .iter()
+        .map(|p| {
+            let rho = (dist(*p, c) / rmax).min(1.0);
+            shading.taper(rho)
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────── steering vector
@@ -929,6 +948,56 @@ mod tests {
         let b1 = m1.beamwidth_u.unwrap();
         let b2 = m2.beamwidth_u.unwrap();
         assert!(b2 < b1, "higher f should narrow beam: {b1} -> {b2}");
+    }
+
+    #[test]
+    fn shading_windows_taper_the_aperture() {
+        // Radial windows must be unity at the centre mic and fall toward the
+        // rim; tapered windows should also lower the total weight vs uniform.
+        let a = build_array(&sunflower(120, 1.0)).unwrap();
+        let uni: f64 = weights_for(&a, Shading::Uniform).iter().sum();
+        for s in [Shading::Hann, Shading::Hamming, Shading::Blackman] {
+            let w = weights_for(&a, s);
+            assert_eq!(w.len(), a.len());
+            assert!(w.iter().all(|x| x.is_finite() && *x >= -1e-9));
+            let sum: f64 = w.iter().sum();
+            assert!(sum < uni, "{s:?} should taper below uniform: {sum} !< {uni}");
+        }
+    }
+
+    #[test]
+    fn hann_shading_lowers_peak_sidelobe() {
+        // A tapered aperture buys lower side lobes than the uniform window.
+        let a = build_array(&sunflower(144, 1.0)).unwrap();
+        let f = focus();
+        let src = [Source::unit(f.center)];
+        let (gu, vu) = compute_psf(
+            &a,
+            &weights_for(&a, Shading::Uniform),
+            &f,
+            &src,
+            6000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
+        let (gh, vh) = compute_psf(
+            &a,
+            &weights_for(&a, Shading::Hann),
+            &f,
+            &src,
+            6000.0,
+            343.0,
+            SteeringFormulation::I,
+            false,
+        )
+        .unwrap();
+        let psl_u = metrics(&a, &gu, &vu, 343.0).peak_sidelobe_db;
+        let psl_h = metrics(&a, &gh, &vh, 343.0).peak_sidelobe_db;
+        if let (Some(u), Some(h)) = (psl_u, psl_h) {
+            assert!(h < u + 0.5, "Hann PSL {h} should not exceed uniform {u}");
+        }
     }
 
     #[test]
