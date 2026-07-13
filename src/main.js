@@ -1,6 +1,7 @@
 import "./style.css";
 import { PSFPlot } from "./psfplot.js";
 import { Geometry3D } from "./geometry3d.js";
+import { LineChart, CHART_PALETTE } from "./linechart.js";
 
 // ───────────────────────── Tauri detection ─────────────────────────
 const isTauri = !!(window.__TAURI_INTERNALS__ || window.__TAURI__);
@@ -58,7 +59,19 @@ const state = {
   // 3D options
   multiplane: false,
   raytrace: false,
+  // broadband sweep
+  sweepFmin: 1000,
+  sweepFmax: 10000,
+  sweepPoints: 24,
+  sweepLog: true,
+  sweepBand: true,
+  showBand: false,
 };
+
+// Last sweep result (not persisted — it is derived and can be large).
+let lastSweep = null;
+// Mirrors psf_core::MAX_SWEEP_POINTS.
+const MAX_SWEEP_POINTS = 200;
 
 // ───────────────────────── views ─────────────────────────
 const plot = new PSFPlot(document.getElementById("plot"));
@@ -179,7 +192,9 @@ $("settings-overlay").addEventListener("click", (e) => {
   if (e.target.id === "settings-overlay") closeSettings();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("settings-overlay").hidden) closeSettings();
+  if (e.key !== "Escape") return;
+  if (!$("settings-overlay").hidden) closeSettings();
+  else if (!$("sweep-overlay").hidden) $("sweep-overlay").hidden = true;
 });
 
 $("settings-apply").addEventListener("click", () => {
@@ -521,8 +536,17 @@ function sourcesInPlane(plane) {
 }
 
 function drawPlot(res) {
+  // Show the band-averaged map instead of the single-frequency one when asked —
+  // but only while it still matches the current grid (the user may have resized
+  // the focus plane since the sweep ran).
+  const band =
+    state.showBand && lastSweep && lastSweep.band_values &&
+    lastSweep.nx === res.nx && lastSweep.ny === res.ny
+      ? lastSweep.band_values
+      : null;
+
   plot.render({
-    values: res.values,
+    values: band || res.values,
     nx: res.nx,
     ny: res.ny,
     u: res.u,
@@ -536,7 +560,7 @@ function drawPlot(res) {
     colormap: state.colormap,
     sources: sourcesInPlane(state.fplane),
   });
-  $("psf-plane").textContent = " · " + state.fplane;
+  $("psf-plane").textContent = " · " + state.fplane + (band ? " · band average" : "");
 }
 
 // Render a PSF result into an offscreen canvas and push the texture to geo
@@ -615,6 +639,162 @@ function planeAxesLabels(label) {
 $("export-png").addEventListener("click", exportPng);
 $("export-csv").addEventListener("click", exportCsv);
 
+// ───────────────────────── frequency sweep ─────────────────────────
+// A sweep is far too costly to run on every slider nudge, so it is explicit:
+// the user presses "Run sweep". Results feed two charts and, optionally, a
+// band-averaged map drawn in place of the single-frequency one.
+let chartBw = null;
+let chartPsl = null;
+
+function buildSweepRequest() {
+  // The base request carries the whole scene; `frequency` is simply swept over
+  // (the Rust SweepRequest ignores it; the JS engine overrides it per step).
+  return {
+    ...buildRequest(state.fplane),
+    f_min: state.sweepFmin,
+    f_max: state.sweepFmax,
+    n_points: Math.round(state.sweepPoints),
+    log_spacing: state.sweepLog,
+    band_map: state.sweepBand,
+  };
+}
+
+async function runSweep() {
+  if (state.source === "csv" && !state.csvText) {
+    toast("Load a CSV of microphone positions first.");
+    return;
+  }
+  const btn = $("sweep-run");
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  try {
+    const req = buildSweepRequest();
+    const inv = await getInvoke();
+    lastSweep = inv ? await inv("compute_sweep", { req }) : jsComputeSweep(req);
+
+    $("sweep-open").disabled = false;
+    const hasBand = !!lastSweep.band_values;
+    $("show-band-row").hidden = !hasBand;
+    if (!hasBand && state.showBand) {
+      state.showBand = false;
+      $("show-band").checked = false;
+    }
+    openSweep();
+    // Repaint the map so a band average (if enabled) takes effect immediately.
+    const r = lastResults[state.fplane];
+    if (r) drawPlot(r);
+  } catch (e) {
+    toast(typeof e === "string" ? e : e.message || "Sweep failed.");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Run sweep";
+  }
+}
+
+function openSweep() {
+  if (!lastSweep) return;
+  $("sweep-overlay").hidden = false;
+  // Built lazily: the hosts have no size until the overlay is shown.
+  if (!chartBw) chartBw = new LineChart($("chart-bw"));
+  if (!chartPsl) chartPsl = new LineChart($("chart-psl"));
+  renderSweepCharts();
+}
+function closeSweep() {
+  $("sweep-overlay").hidden = true;
+}
+
+function renderSweepCharts() {
+  if (!lastSweep || !chartBw || !chartPsl) return;
+  const pts = lastSweep.points;
+  // A metric can be undefined at a given frequency (e.g. the −3 dB crossing
+  // falls outside the grid). NaN leaves a gap in the line rather than a spike.
+  const at = (p, key, scale = 1) => [p.frequency, p[key] == null ? NaN : p[key] * scale];
+
+  const markers = lastSweep.alias_frequency
+    ? [{ x: lastSweep.alias_frequency, label: "alias" }]
+    : [];
+  const fFmt = (v) => (v >= 1000 ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k` : `${v.toFixed(0)}`);
+
+  chartBw.render({
+    series: [
+      { label: "u", color: CHART_PALETTE[0], points: pts.map((p) => at(p, "beamwidth_u", 1000)) },
+      { label: "v", color: CHART_PALETTE[1], points: pts.map((p) => at(p, "beamwidth_v", 1000)) },
+    ],
+    xLabel: "frequency (Hz)",
+    yLabel: "width (mm)",
+    xLog: state.sweepLog,
+    markers,
+    xFormat: fFmt,
+    yFormat: (v) => v.toFixed(0),
+  });
+
+  chartPsl.render({
+    series: [
+      { label: "PSL", color: CHART_PALETTE[2], points: pts.map((p) => at(p, "peak_sidelobe_db")) },
+    ],
+    xLabel: "frequency (Hz)",
+    yLabel: "level (dB)",
+    xLog: state.sweepLog,
+    markers,
+    xFormat: fFmt,
+    yFormat: (v) => v.toFixed(1),
+  });
+
+  const f0 = pts[0].frequency;
+  const f1 = pts[pts.length - 1].frequency;
+  $("sweep-sub").textContent = ` · ${pts.length} points · ${fmtFreq(f0)} – ${fmtFreq(f1)}`;
+}
+
+function exportSweepCsv() {
+  if (!lastSweep) {
+    toast("Run a sweep first.");
+    return;
+  }
+  const lines = [];
+  lines.push("# PSF Array Viewer — frequency sweep");
+  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval} noise_dB=${state.noiseEnabled ? state.noiseDb : "off"}`);
+  lines.push(`# mics=${lastSweep.n_mics} aperture_m=${lastSweep.aperture} alias_Hz=${lastSweep.alias_frequency ?? ""}`);
+  lines.push("frequency_Hz,beamwidth_u_m,beamwidth_v_m,peak_sidelobe_dB");
+  for (const p of lastSweep.points) {
+    lines.push([
+      p.frequency,
+      p.beamwidth_u ?? "",
+      p.beamwidth_v ?? "",
+      p.peak_sidelobe_db ?? "",
+    ].join(","));
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  downloadBlob(blob, `psf-sweep-${timestamp()}.csv`);
+}
+
+// Sweep parameters do not affect the live map, so they must not trigger compute.
+function bindSweepNumber(id, setter) {
+  const el = $(id);
+  el.addEventListener("input", () => setter(parseFloat(el.value)));
+}
+bindSweepNumber("sweep-fmin", (v) => { if (v > 0) state.sweepFmin = v; });
+bindSweepNumber("sweep-fmax", (v) => { if (v > 0) state.sweepFmax = v; });
+bindSweepNumber("sweep-points", (v) => {
+  if (v >= 2) state.sweepPoints = Math.min(MAX_SWEEP_POINTS, Math.round(v));
+});
+$("sweep-log").addEventListener("change", (e) => {
+  state.sweepLog = e.target.checked;
+  if (lastSweep) renderSweepCharts();
+});
+$("sweep-band").addEventListener("change", (e) => { state.sweepBand = e.target.checked; });
+$("show-band").addEventListener("change", (e) => {
+  state.showBand = e.target.checked;
+  const r = lastResults[state.fplane];
+  if (r) drawPlot(r);
+});
+$("sweep-run").addEventListener("click", runSweep);
+$("sweep-open").addEventListener("click", openSweep);
+$("sweep-close").addEventListener("click", closeSweep);
+$("sweep-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "sweep-overlay") closeSweep();
+});
+$("sweep-csv").addEventListener("click", exportSweepCsv);
+
 // ───────────────────────── cursor readout ─────────────────────────
 (function bindReadout() {
   const host = $("plot");
@@ -691,6 +871,16 @@ function syncAllControls() {
   $("noise-enable").checked = state.noiseEnabled;
   $("noise-field").hidden = !state.noiseEnabled;
   $("lines").checked = state.lines;
+
+  $("sweep-fmin").value = state.sweepFmin;
+  $("sweep-fmax").value = state.sweepFmax;
+  $("sweep-points").value = state.sweepPoints;
+  $("sweep-log").checked = state.sweepLog;
+  $("sweep-band").checked = state.sweepBand;
+  // A restored session has no sweep result yet, so the band controls stay off.
+  state.showBand = false;
+  $("show-band").checked = false;
+  $("show-band-row").hidden = true;
   if (state.csvName) $("csv-status").textContent = `Loaded ${state.csvName}`;
 
   updateSourceVisibility();
@@ -1010,7 +1200,66 @@ function jsCompute(req) {
   }
 
   const metrics = metricsJS(arr, g, values, req.speed_of_sound);
-  return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, metrics };
+  // `raw` (un-normalised linear power) is returned alongside the dB map so a
+  // sweep can band-average in the power domain before normalising once.
+  return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, raw, metrics };
+}
+
+// Mirrors psf_core::sweep_frequencies.
+function sweepFrequenciesJS(fMin, fMax, n, log) {
+  if (!(n >= 1)) throw "Sweep needs at least one frequency point.";
+  if (n > MAX_SWEEP_POINTS) throw `Sweep is limited to ${MAX_SWEEP_POINTS} frequency points.`;
+  if (!isFinite(fMin) || !isFinite(fMax) || fMin <= 0 || fMax <= 0) throw "Sweep frequencies must be positive.";
+  if (fMax < fMin) throw "Sweep f max must be at least f min.";
+  if (n === 1) return [fMin];
+  const nn = n - 1;
+  return Array.from({ length: n }, (_, i) => {
+    const t = i / nn;
+    return log ? fMin * Math.pow(fMax / fMin, t) : fMin + t * (fMax - fMin);
+  });
+}
+
+// Mirrors psf_core::compute_sweep — per-frequency metrics plus an optional
+// incoherent (power-domain) band average, normalised once at the end.
+function jsComputeSweep(req) {
+  const freqs = sweepFrequenciesJS(req.f_min, req.f_max, req.n_points, req.log_spacing);
+  const points = [];
+  let band = null;
+  let first = null;
+
+  for (const f of freqs) {
+    const r = jsCompute({ ...req, frequency: f });
+    if (!first) first = r;
+    if (req.band_map) {
+      if (!band) band = new Float64Array(r.raw.length);
+      for (let i = 0; i < band.length; i++) band[i] += r.raw[i];
+    }
+    points.push({
+      frequency: f,
+      beamwidth_u: r.metrics.beamwidth_u,
+      beamwidth_v: r.metrics.beamwidth_v,
+      peak_sidelobe_db: r.metrics.peak_sidelobe_db,
+    });
+  }
+
+  let band_values = null;
+  if (req.band_map && band) {
+    let p0 = 1e-30;
+    for (let i = 0; i < band.length; i++) if (band[i] > p0) p0 = band[i];
+    band_values = new Float32Array(band.length);
+    for (let i = 0; i < band.length; i++) {
+      band_values[i] = Math.max(-300, 10 * Math.log10(band[i] / p0 + 1e-30));
+    }
+  }
+
+  return {
+    points,
+    band_values,
+    nx: first.nx, ny: first.ny, u: first.u, v: first.v,
+    alias_frequency: first.metrics.alias_frequency,
+    aperture: first.metrics.aperture,
+    n_mics: first.metrics.n_mics,
+  };
 }
 
 function halfWidth(coords, line, center, fwd) {

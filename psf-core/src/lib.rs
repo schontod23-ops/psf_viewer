@@ -831,6 +831,167 @@ pub fn metrics(array: &Array, grid: &Grid, values: &[f32], frequency_c: f64) -> 
     }
 }
 
+// ─────────────────────────────────────────────────────────── frequency sweep
+
+/// Upper bound on swept frequency points, so a stray UI value cannot wedge the
+/// app with an unbounded amount of work.
+pub const MAX_SWEEP_POINTS: usize = 200;
+
+/// The frequency-dependent metrics at one swept frequency.
+#[derive(Clone, Debug, Serialize)]
+pub struct SweepPoint {
+    pub frequency: f64,
+    pub beamwidth_u: Option<f64>,
+    pub beamwidth_v: Option<f64>,
+    pub peak_sidelobe_db: Option<f32>,
+}
+
+/// Result of a broadband sweep over a fixed array + focus grid.
+#[derive(Clone, Debug, Serialize)]
+pub struct SweepResult {
+    pub points: Vec<SweepPoint>,
+    /// Incoherent (power) band-average of the maps across every swept frequency,
+    /// normalised once to its own peak (dB). `None` unless `band_map` was set.
+    pub band_values: Option<Vec<f32>>,
+    pub nx: usize,
+    pub ny: usize,
+    pub u: Vec<f64>,
+    pub v: Vec<f64>,
+    /// Frequency-independent geometry facts, so callers need not recompute them.
+    pub alias_frequency: Option<f64>,
+    pub aperture: f64,
+    pub n_mics: usize,
+}
+
+/// Build the swept frequency list: `n` points from `f_min` to `f_max`,
+/// logarithmically spaced when `log_spacing` (the useful default in acoustics).
+pub fn sweep_frequencies(
+    f_min: f64,
+    f_max: f64,
+    n: usize,
+    log_spacing: bool,
+) -> Result<Vec<f64>, String> {
+    if n == 0 {
+        return Err("Sweep needs at least one frequency point.".into());
+    }
+    if n > MAX_SWEEP_POINTS {
+        return Err(format!(
+            "Sweep is limited to {MAX_SWEEP_POINTS} frequency points."
+        ));
+    }
+    if !f_min.is_finite() || !f_max.is_finite() || f_min <= 0.0 || f_max <= 0.0 {
+        return Err("Sweep frequencies must be positive.".into());
+    }
+    if f_max < f_min {
+        return Err("Sweep f_max must be at least f_min.".into());
+    }
+    if n == 1 {
+        return Ok(vec![f_min]);
+    }
+    let nn = (n - 1) as f64;
+    Ok((0..n)
+        .map(|i| {
+            let t = i as f64 / nn;
+            if log_spacing {
+                f_min * (f_max / f_min).powf(t)
+            } else {
+                f_min + t * (f_max - f_min)
+            }
+        })
+        .collect())
+}
+
+/// Sweep the beamformer across `frequencies` over a fixed array and focus grid.
+///
+/// Per frequency it records the frequency-dependent metrics (−3 dB beamwidths and
+/// peak side-lobe level). With `band_map` it also accumulates the **raw linear**
+/// power maps and normalises the total once at the end — an incoherent
+/// band-average. Summing raw power (rather than per-frequency dB) is the whole
+/// reason [`compute_at_points`] returns un-normalised power.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_sweep(
+    array: &Array,
+    weights: &[f64],
+    focus: &FocusConfig,
+    sources: &[Source],
+    frequencies: &[f64],
+    speed_of_sound: f64,
+    formulation: SteeringFormulation,
+    diag_removal: bool,
+    noise_power: f64,
+    band_map: bool,
+) -> Result<SweepResult, String> {
+    if frequencies.is_empty() {
+        return Err("Sweep needs at least one frequency point.".into());
+    }
+    if frequencies.len() > MAX_SWEEP_POINTS {
+        return Err(format!(
+            "Sweep is limited to {MAX_SWEEP_POINTS} frequency points."
+        ));
+    }
+    let grid = focus.grid()?;
+    let (uh, vh, _) = focus.plane.basis();
+    let mut points = Vec::with_capacity(grid.nx * grid.ny);
+    for &vv in &grid.v {
+        for &uu in &grid.u {
+            points.push(add(focus.center, add(scale(uh, uu), scale(vh, vv))));
+        }
+    }
+
+    let mut band = if band_map { vec![0f64; points.len()] } else { Vec::new() };
+    let mut swept = Vec::with_capacity(frequencies.len());
+    // The geometry metrics (aperture, alias frequency, mic count) do not depend
+    // on frequency — capture them once from the first pass.
+    let mut geometry: Option<Metrics> = None;
+
+    for &f in frequencies {
+        let raw = compute_at_points(
+            array,
+            weights,
+            &points,
+            sources,
+            f,
+            speed_of_sound,
+            formulation,
+            diag_removal,
+            noise_power,
+        )?;
+        if band_map {
+            for (b, r) in band.iter_mut().zip(raw.iter()) {
+                *b += *r;
+            }
+        }
+        let values = normalize_to_db(&raw);
+        let m = metrics(array, &grid, &values, speed_of_sound);
+        swept.push(SweepPoint {
+            frequency: f,
+            beamwidth_u: m.beamwidth_u,
+            beamwidth_v: m.beamwidth_v,
+            peak_sidelobe_db: m.peak_sidelobe_db,
+        });
+        if geometry.is_none() {
+            geometry = Some(m);
+        }
+    }
+
+    let geom = geometry.unwrap_or_default();
+    Ok(SweepResult {
+        points: swept,
+        band_values: if band_map {
+            Some(normalize_to_db(&band))
+        } else {
+            None
+        },
+        nx: grid.nx,
+        ny: grid.ny,
+        u: grid.u,
+        v: grid.v,
+        alias_frequency: geom.alias_frequency,
+        aperture: geom.aperture,
+        n_mics: geom.n_mics,
+    })
+}
+
 // ─────────────────────────────────────────────────────────── tests
 
 #[cfg(test)]
@@ -1396,5 +1557,87 @@ mod tests {
             max_diff < 1e-3,
             "diagonal removal should cancel sensor noise, max diff {max_diff}"
         );
+    }
+
+    #[test]
+    fn sweep_frequencies_span_the_range() {
+        let lin = sweep_frequencies(1000.0, 5000.0, 5, false).unwrap();
+        assert_eq!(lin.len(), 5);
+        assert!((lin[0] - 1000.0).abs() < 1e-9);
+        assert!((lin[4] - 5000.0).abs() < 1e-9);
+        assert!((lin[2] - 3000.0).abs() < 1e-9, "linear midpoint: {}", lin[2]);
+
+        let log = sweep_frequencies(1000.0, 10000.0, 3, true).unwrap();
+        assert!((log[0] - 1000.0).abs() < 1e-9);
+        assert!((log[2] - 10000.0).abs() < 1e-6);
+        // Log midpoint of a decade is the geometric mean.
+        assert!((log[1] - 3162.277).abs() < 0.1, "log midpoint: {}", log[1]);
+
+        assert!(sweep_frequencies(1000.0, 500.0, 4, true).is_err());
+        assert!(sweep_frequencies(0.0, 500.0, 4, true).is_err());
+        assert!(sweep_frequencies(100.0, 500.0, MAX_SWEEP_POINTS + 1, true).is_err());
+    }
+
+    #[test]
+    fn sweep_tracks_beamwidth_against_frequency() {
+        // The main lobe must narrow as frequency rises — the sweep should show
+        // that trend end-to-end, which is the whole point of the feature.
+        let a = build_array(&sunflower(81, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let freqs = sweep_frequencies(2000.0, 8000.0, 5, true).unwrap();
+        let sweep = compute_sweep(
+            &a,
+            &w,
+            &focus(),
+            &[Source::unit(focus().center)],
+            &freqs,
+            343.0,
+            SteeringFormulation::I,
+            false,
+            0.0,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(sweep.points.len(), 5);
+        assert!(sweep.band_values.is_none(), "band map was not requested");
+        assert_eq!(sweep.n_mics, 81);
+        assert!(sweep.alias_frequency.unwrap() > 0.0);
+
+        let first = sweep.points.first().unwrap().beamwidth_u.unwrap();
+        let last = sweep.points.last().unwrap().beamwidth_u.unwrap();
+        assert!(last < first, "beam should narrow with frequency: {first} -> {last}");
+    }
+
+    #[test]
+    fn sweep_band_average_is_a_valid_normalised_map() {
+        // The band map is an incoherent power sum across the band, normalised
+        // once — so it must peak at 0 dB and stay finite everywhere.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let freqs = sweep_frequencies(3000.0, 6000.0, 4, true).unwrap();
+        let sweep = compute_sweep(
+            &a,
+            &w,
+            &f,
+            &[Source::unit(f.center)],
+            &freqs,
+            343.0,
+            SteeringFormulation::I,
+            false,
+            0.0,
+            true,
+        )
+        .unwrap();
+
+        let band = sweep.band_values.expect("band map was requested");
+        assert_eq!(band.len(), sweep.nx * sweep.ny);
+        assert!(band.iter().all(|v| v.is_finite()));
+        let peak = band.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(peak.abs() < 1e-3, "band map should peak at 0 dB, got {peak}");
+        // The source sits at the grid centre, so the band peak belongs there too.
+        let centre = band[(sweep.ny / 2) * sweep.nx + (sweep.nx / 2)];
+        assert!(centre.abs() < 1e-3, "band peak should be at the source: {centre}");
     }
 }

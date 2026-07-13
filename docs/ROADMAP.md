@@ -37,16 +37,20 @@ change lands in both engines** unless a feature is explicitly native-only.
   returns **raw linear power**; `normalize_to_db` converts to peak-referenced dB.
   Lets callers combine maps before normalizing (band-averaging, shared-reference
   A/B, noise floor).
-- **R3 — shared modules** *(todo)*: a colormap-LUT module shared by `psfplot.js`
-  and 3-D mesh coloring (task 4); one small canvas line-chart component reused by
-  the sweep chart (1), line-cut (2), and A/B overlay (3).
+- **R3 — shared modules** *(partly done)*: `src/linechart.js` is the small
+  dependency-free canvas line-chart component — used by the sweep charts now, and
+  reused by the line-cut (2) and A/B overlay (3). Still to do: a colormap-LUT
+  module shared by `psfplot.js` and 3-D mesh coloring (task 4).
 
 ## Feature tasks
 
-1. **Broadband / frequency-sweep analysis.** `compute_sweep(fmin,fmax,points,
-   spacing,band)` over the current geometry; per-frequency metrics (beamwidth,
-   PSL, max-sidelobe) + incoherent band-averaged maps (needs R2). Analysis panel
-   with a "Run sweep" button (too costly live) and a canvas line-chart (log-f x).
+1. **Broadband / frequency-sweep analysis.** *(done)* `compute_sweep` runs the
+   beamformer across a lin/log frequency band, recording −3 dB beamwidths and peak
+   side-lobe level per frequency, and optionally accumulating an incoherent
+   band-averaged map (raw power summed, normalised once — the reason for R2).
+   Driven from an Analysis panel with an explicit "Run sweep" button (too costly
+   to run live); results plot in a sweep dialog with the aliasing frequency marked,
+   export to CSV, and the band map can replace the single-frequency map.
 2. **Optional 1-D line-cut.** Off by default behind a toggle. Client-side polyline
    sampling of the current map (`PSFPlot.sampleLine`), rendered in the shared line
    chart; supports pinning cuts to overlay across settings. No engine change.
@@ -83,5 +87,7 @@ change lands in both engines** unless a feature is explicitly native-only.
 ## Suggested sequencing
 
 1. R1 + R2 *(done)* → task 6 noise floor *(done)*
-2. Task 1 sweep (needs R2) → task 2 line-cut (R3 chart) → task 3 A/B + PDF (R2, R3)
-3. Task 4 STL (R1, R3) → task 5 mic editor → task 7 functional beamforming
+2. R3 line-chart *(done)* → task 1 sweep *(done)*
+3. Task 2 line-cut (reuses the R3 chart) → task 3 A/B + PDF (R2, R3)
+4. Task 4 STL (R1, + R3 colormap module) → task 5 mic editor → task 7 functional
+   beamforming

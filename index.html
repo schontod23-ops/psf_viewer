@@ -274,6 +274,36 @@
         </section>
 
         <section class="group">
+          <div class="eyebrow">Analysis</div>
+          <div class="field grid2">
+            <label><span>f min (Hz)</span><input type="number" id="sweep-fmin" value="1000" min="1" step="100" /></label>
+            <label><span>f max (Hz)</span><input type="number" id="sweep-fmax" value="10000" min="1" step="100" /></label>
+          </div>
+          <div class="field grid2">
+            <label><span>Points</span><input type="number" id="sweep-points" value="24" min="2" max="200" step="1" /></label>
+            <label><span>&nbsp;</span>
+              <label class="check" style="margin:0">
+                <input type="checkbox" id="sweep-log" checked />
+                <span>Log spacing</span>
+              </label>
+            </label>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="sweep-band" checked />
+            <span>Band-averaged map</span>
+          </label>
+          <label class="check" id="show-band-row" hidden>
+            <input type="checkbox" id="show-band" />
+            <span>Show band average on map</span>
+          </label>
+          <div class="field grid2" style="margin-top:12px">
+            <button class="file-btn" id="sweep-run">Run sweep</button>
+            <button class="file-btn" id="sweep-open" disabled>Charts…</button>
+          </div>
+          <p class="hint">Sweeps the band and plots beamwidth and peak side-lobe vs frequency. Not live — press Run.</p>
+        </section>
+
+        <section class="group">
           <div class="eyebrow">Configuration</div>
           <div class="field grid2">
             <button class="file-btn" id="config-save">Save…</button>
@@ -364,6 +394,25 @@
         <div class="modal-foot">
           <button class="file-btn" id="settings-reset">Reset to defaults</button>
           <button class="file-btn" id="settings-apply">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── sweep modal ───────────────────────── -->
+    <div class="modal-overlay" id="sweep-overlay" hidden>
+      <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="sweep-title">
+        <div class="modal-head">
+          <h2 id="sweep-title">Frequency sweep<span class="dim" id="sweep-sub"></span></h2>
+          <button class="modal-close" id="sweep-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="chart-title">−3 dB main-lobe width</div>
+          <div class="chart-host" id="chart-bw"></div>
+          <div class="chart-title">Peak side-lobe level</div>
+          <div class="chart-host" id="chart-psl"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="sweep-csv">Export CSV</button>
         </div>
       </div>
     </div>

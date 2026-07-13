@@ -2,8 +2,8 @@
 //! request from the webview, calls the engine, and serialises the result back.
 
 use psf_core::{
-    build_array, compute_psf, metrics as compute_metrics, weights_for, ArraySource, FocusConfig,
-    Metrics, Shading, Source, SteeringFormulation,
+    build_array, compute_psf, metrics as compute_metrics, sweep_frequencies, weights_for,
+    ArraySource, FocusConfig, Metrics, Shading, Source, SteeringFormulation, SweepResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,10 +70,55 @@ fn compute(req: ComputeRequest) -> Result<ComputeResponse, String> {
     })
 }
 
+/// A broadband sweep over the same scene, at `n_points` frequencies from `f_min`
+/// to `f_max`. Optionally also returns an incoherent band-averaged map.
+#[derive(Deserialize)]
+pub struct SweepRequest {
+    array: ArraySource,
+    focus: FocusConfig,
+    sources: Vec<Source>,
+    speed_of_sound: f64,
+    shading: Shading,
+    #[serde(default)]
+    steering: SteeringFormulation,
+    #[serde(default)]
+    diag_removal: bool,
+    #[serde(default)]
+    noise_power: f64,
+    f_min: f64,
+    f_max: f64,
+    n_points: usize,
+    #[serde(default)]
+    log_spacing: bool,
+    #[serde(default)]
+    band_map: bool,
+}
+
+/// Resolve the array, sweep the beamformer across the frequency band, and return
+/// per-frequency metrics plus (optionally) the band-averaged map.
+#[tauri::command]
+fn compute_sweep(req: SweepRequest) -> Result<SweepResult, String> {
+    let array = build_array(&req.array)?;
+    let weights = weights_for(&array, req.shading);
+    let frequencies = sweep_frequencies(req.f_min, req.f_max, req.n_points, req.log_spacing)?;
+    psf_core::compute_sweep(
+        &array,
+        &weights,
+        &req.focus,
+        &req.sources,
+        &frequencies,
+        req.speed_of_sound,
+        req.steering,
+        req.diag_removal,
+        req.noise_power,
+        req.band_map,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![compute])
+        .invoke_handler(tauri::generate_handler![compute, compute_sweep])
         .run(tauri::generate_context!())
         .expect("error while running PSF Array Viewer");
 }
