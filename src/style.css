@@ -475,6 +475,67 @@ input[type="number"]:focus, .file-btn:focus-visible {
 .file-btn:disabled { opacity: 0.4; cursor: default; border-color: var(--stroke); color: var(--ink-faint); }
 .file-btn:disabled:hover { border-color: var(--stroke); }
 
+/* ───────────────────────── A/B comparison ──────────────────────── */
+
+.ab-maps { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+.ab-maps figure { margin: 0; }
+.ab-maps figcaption {
+  font-size: 9.5px; letter-spacing: 0.6px; text-transform: uppercase;
+  color: var(--ink-faint); margin-bottom: 6px;
+}
+.ab-maps img {
+  width: 100%; display: block; border-radius: var(--radius-sm);
+  border: 1px solid var(--stroke); background: rgba(8, 12, 19, 0.5);
+}
+.ab-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 14px; }
+.ab-table th, .ab-table td {
+  text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--stroke);
+  font-family: var(--font-mono);
+}
+.ab-table th:first-child, .ab-table td:first-child {
+  text-align: left; font-family: var(--font-ui); color: var(--ink-dim);
+}
+.ab-table thead th {
+  font-family: var(--font-ui); font-size: 9.5px; letter-spacing: 0.6px;
+  text-transform: uppercase; color: var(--ink-faint);
+}
+.ab-table .delta { color: var(--accent); }
+
+/* ───────────────────────── printable report ────────────────────── */
+
+#report { display: none; }
+
+@media print {
+  html, body {
+    height: auto; overflow: visible;
+    background: #fff; color: #111;
+  }
+  body > *:not(#report) { display: none !important; }
+  #report { display: block; }
+
+  @page { margin: 16mm; }
+
+  #report h1 { font-size: 18pt; margin: 0 0 2mm; }
+  #report .meta { color: #666; font-size: 9pt; margin-bottom: 8mm; }
+  #report h2 {
+    font-size: 11pt; margin: 8mm 0 3mm;
+    border-bottom: 1px solid #ccc; padding-bottom: 1.5mm;
+  }
+  #report table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+  #report th, #report td {
+    text-align: right; padding: 1.5mm 2mm; border-bottom: 1px solid #e2e2e2;
+  }
+  #report th:first-child, #report td:first-child { text-align: left; }
+  #report thead th { color: #666; font-weight: 600; }
+  #report .maps { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; }
+  #report .maps.single { grid-template-columns: 1fr; max-width: 60%; }
+  #report figure { margin: 0; break-inside: avoid; }
+  #report figcaption { font-size: 8pt; color: #666; margin-bottom: 1.5mm; }
+  #report img { width: 100%; display: block; border: 1px solid #ddd; }
+  #report .notes { font-size: 9pt; white-space: pre-wrap; }
+  #report section { break-inside: avoid; }
+}
+
 /* ───────────────────────── entrance choreography ────────────────── */
 
 @keyframes rise {

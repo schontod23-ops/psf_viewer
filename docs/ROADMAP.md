@@ -58,10 +58,15 @@ change lands in both engines** unless a feature is explicitly native-only.
    the shared line chart with a −3 dB reference. Cuts can be **pinned** as dashed
    overlays to compare frequencies, shadings or algorithms. No engine change —
    the map data is already client-side.
-3. **Array A/B comparison + PDF report.** Two config snapshots computed and shown
-   side-by-side with a metrics diff (optionally on a shared dB reference via R2).
-   Report via print-to-PDF: a clean report DOM (config tables, embedded map PNGs,
-   metrics, optional charts, notes) + `window.print()`.
+3. **Array A/B comparison + PDF report.** *(done)* Snapshotting a design into slot
+   A or B captures what is already on screen — state, metrics, the rendered map and
+   the line cuts — so comparing costs no recompute. The compare dialog shows the two
+   maps side by side, a metrics table with a Δ (B−A) column, and the two designs'
+   cuts overlaid in the shared chart. The report is built as a plain DOM subtree
+   that only `@media print` reveals and handed to `window.print()`, which every
+   platform renders straight to PDF; it carries the map images, the metrics table,
+   the full configuration of each design, and the sweep charts when a sweep has run.
+   No PDF library is bundled.
 4. **Loadable STL, PSF on surface points.** *(done)* The STL is parsed client-side
    (three.js `STLLoader`) with a units→metres scale. Its surface vertices are
    thinned to a 4000-point budget and beamformed through the R1 point-cloud core
@@ -96,10 +101,8 @@ change lands in both engines** unless a feature is explicitly native-only.
    new; for a single source it is closed-form. Runs in both engines. UI: an
    algorithm selector (Conventional / Functional) plus a ν control.
 
-## Suggested sequencing
+## Status
 
-1. R1 + R2 *(done)* → task 6 noise floor *(done)*
-2. R3 line-chart *(done)* → task 1 sweep *(done)*
-3. Task 2 line-cut (reuses the R3 chart) → task 3 A/B + PDF (R2, R3)
-4. Task 4 STL (R1, + R3 colormap module) → task 5 mic editor → task 7 functional
-   beamforming
+All foundational refactors (R1, R2, R3) and all seven feature tasks are **done**.
+Ideas parked for later: a k-space / co-array diagram, array-layout optimisation,
+robustness (Monte-Carlo mic-placement error), and measured-data import.

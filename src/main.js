@@ -208,6 +208,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("settings-overlay").hidden) closeSettings();
   else if (!$("sweep-overlay").hidden) $("sweep-overlay").hidden = true;
+  else if (!$("compare-overlay").hidden) closeCompare();
   // The editor's own canvas uses Esc to clear its selection, so only close the
   // dialog when the canvas does not have focus.
   else if (!$("mic-overlay").hidden && document.activeElement !== (micEditor && micEditor.canvas)) {
@@ -1264,6 +1265,223 @@ $("config-input").addEventListener("change", (e) => {
   reader.onerror = () => toast("Could not read that file.");
   reader.readAsText(file);
   e.target.value = ""; // allow re-loading the same file
+});
+
+// ───────────────────────── A/B comparison + PDF report ─────────────────────────
+// A snapshot captures what is *already* on screen — the state, the metrics, the
+// rendered map, and the line cuts — so switching designs needs no recompute.
+const snapshots = { A: null, B: null };
+let chartAb = null;
+
+function takeSnapshot(slot) {
+  const res = lastResults[state.fplane];
+  if (!res) {
+    toast("Nothing to capture yet.");
+    return;
+  }
+  snapshots[slot] = {
+    slot,
+    time: new Date().toLocaleString(),
+    state: JSON.parse(JSON.stringify(state)),
+    metrics: res.metrics,
+    // The plot canvas already carries axes and the colorbar, so it stands alone.
+    png: plot.canvas.toDataURL("image/png"),
+    cuts: currentCuts(),
+  };
+  updateSnapStatus();
+}
+
+function updateSnapStatus() {
+  const tag = (s) => (snapshots[s] ? describeDesign(snapshots[s].state) : "empty");
+  $("snap-status").textContent = `A: ${tag("A")}   ·   B: ${tag("B")}`;
+  $("compare-open").disabled = !(snapshots.A && snapshots.B);
+}
+
+// A one-line human description of a design, used for slot labels and captions.
+function describeDesign(s) {
+  const arr =
+    s.source === "sunflower" ? `sunflower ${s.n}·${s.diameter}m`
+    : s.source === "ring" ? `ring ${s.ringN}·${s.ringDiameter}m`
+    : s.source === "grid" ? `grid ${s.gridNx}×${s.gridNy}·${s.gridPitch}m`
+    : s.source === "cross" ? `cross ${s.crossN}·${s.crossLength}m`
+    : s.source === "manual" ? `manual ${(s.manualPos || []).length} mics`
+    : `csv ${s.csvName || ""}`;
+  const alg = s.algorithm === "functional" ? `functional ν${s.nu}` : "conventional";
+  return `${arr} · ${fmtFreq(s.frequency)} · ${alg}`;
+}
+
+// Rows for the metrics table. `fmt` renders a value; `delta` renders B − A.
+const METRIC_ROWS = [
+  { key: "n_mics", label: "Microphones", fmt: (v) => (v == null ? "—" : `${v}`), diff: (a, b) => `${b - a > 0 ? "+" : ""}${b - a}` },
+  { key: "aperture", label: "Aperture", fmt: (v) => (v == null ? "—" : fmtLen(v)), diff: (a, b) => fmtLen(b - a) },
+  { key: "beamwidth_u", label: "−3 dB beam (u)", fmt: (v) => (v == null ? "—" : `${(v * 1000).toFixed(0)} mm`), diff: (a, b) => `${((b - a) * 1000).toFixed(0)} mm` },
+  { key: "beamwidth_v", label: "−3 dB beam (v)", fmt: (v) => (v == null ? "—" : `${(v * 1000).toFixed(0)} mm`), diff: (a, b) => `${((b - a) * 1000).toFixed(0)} mm` },
+  { key: "peak_sidelobe_db", label: "Peak side lobe", fmt: (v) => (v == null ? "—" : `${v.toFixed(1)} dB`), diff: (a, b) => `${(b - a).toFixed(1)} dB` },
+  { key: "alias_frequency", label: "Alias frequency", fmt: (v) => (v == null ? "—" : fmtFreq(v)), diff: (a, b) => fmtFreq(b - a) },
+];
+
+function metricsTableHtml(a, b) {
+  const head = b
+    ? "<thead><tr><th>Metric</th><th>A</th><th>B</th><th>Δ (B−A)</th></tr></thead>"
+    : "<thead><tr><th>Metric</th><th>Value</th></tr></thead>";
+  const rows = METRIC_ROWS.map((r) => {
+    const va = a.metrics[r.key];
+    if (!b) return `<tr><td>${r.label}</td><td>${r.fmt(va)}</td></tr>`;
+    const vb = b.metrics[r.key];
+    const d = va != null && vb != null ? r.diff(va, vb) : "—";
+    return `<tr><td>${r.label}</td><td>${r.fmt(va)}</td><td>${r.fmt(vb)}</td><td class="delta">${d}</td></tr>`;
+  }).join("");
+  return `${head}<tbody>${rows}</tbody>`;
+}
+
+function openCompare() {
+  const { A, B } = snapshots;
+  if (!A || !B) return;
+  $("compare-overlay").hidden = false;
+
+  $("ab-img-a").src = A.png;
+  $("ab-img-b").src = B.png;
+  $("ab-cap-a").textContent = `A — ${describeDesign(A.state)}`;
+  $("ab-cap-b").textContent = `B — ${describeDesign(B.state)}`;
+  $("ab-table").innerHTML = metricsTableHtml(A, B);
+
+  // Overlay the two designs' cuts, if both snapshots captured them.
+  const both = A.cuts && B.cuts;
+  $("chart-ab").hidden = !both;
+  $("ab-cut-title").hidden = !both;
+  if (both) {
+    if (!chartAb) chartAb = new LineChart($("chart-ab"));
+    chartAb.render({
+      series: [
+        { label: "A u", color: CHART_PALETTE[0], points: A.cuts.u },
+        { label: "A v", color: CHART_PALETTE[0], points: A.cuts.v, dashed: true },
+        { label: "B u", color: CHART_PALETTE[2], points: B.cuts.u },
+        { label: "B v", color: CHART_PALETTE[2], points: B.cuts.v, dashed: true },
+      ],
+      xLabel: "position through peak (m)",
+      yLabel: "level (dB)",
+      xLog: false,
+      hLines: [{ y: -3, label: "−3 dB" }],
+      xFormat: (v) => v.toFixed(2),
+      yFormat: (v) => v.toFixed(0),
+    });
+  }
+}
+function closeCompare() {
+  $("compare-overlay").hidden = true;
+}
+
+// ── printable report ──
+// Built as a plain DOM subtree that only @media print reveals, then handed to the
+// browser's print dialog — which every platform can render straight to PDF. No PDF
+// library is bundled; this project keeps its payload small on purpose.
+function configRowsHtml(s) {
+  const rows = [
+    ["Array", describeDesign(s)],
+    ["Array plane / centre", `${s.aplane} · [${s.acenter.join(", ")}] m`],
+    ["Focus plane / centre", `${s.fplane} · [${s.fcenter.join(", ")}] m`],
+    ["Focus size / step", `${s.width} × ${s.height} m · dx ${s.dx} m`],
+    ["Frequency", fmtFreq(s.frequency)],
+    ["Speed of sound", `${s.c} m/s`],
+    ["Shading", s.shading],
+    ["Steering", `Formulation ${s.steering}`],
+    ["Algorithm", s.algorithm === "functional" ? `Functional (ν = ${s.nu})` : "Conventional"],
+    ["Diagonal removal", s.algorithm === "functional" ? "n/a" : s.diagRemoval ? "on" : "off"],
+    ["Sensor noise", s.noiseEnabled ? `${s.noiseDb} dB` : "off"],
+    ["Sources", `${1 + (s.extraSources || []).length}`],
+    ["Dynamic range", `${s.dyn} dB`],
+  ];
+  return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+}
+
+function designSectionHtml(snap, title) {
+  return `
+    <section>
+      <h2>${title}</h2>
+      <table><tbody>${configRowsHtml(snap.state)}</tbody></table>
+    </section>`;
+}
+
+function buildReport() {
+  const { A, B } = snapshots;
+  // Compare A/B when both slots are filled; otherwise report the live design.
+  let designs = [];
+  if (A && B) designs = [A, B];
+  else if (A || B) designs = [A || B];
+  else {
+    const res = lastResults[state.fplane];
+    if (!res) {
+      toast("Nothing to report yet.");
+      return false;
+    }
+    designs = [{
+      slot: "—",
+      state: JSON.parse(JSON.stringify(state)),
+      metrics: res.metrics,
+      png: plot.canvas.toDataURL("image/png"),
+      cuts: currentCuts(),
+    }];
+  }
+
+  const maps = designs
+    .map((d) => `<figure><figcaption>${d.slot !== "—" ? d.slot + " — " : ""}${describeDesign(d.state)}</figcaption><img src="${d.png}" /></figure>`)
+    .join("");
+
+  const two = designs.length === 2;
+  const sweepHtml =
+    lastSweep && chartBw && chartPsl
+      ? `<section>
+           <h2>Frequency sweep</h2>
+           <div class="maps">
+             <figure><figcaption>−3 dB main-lobe width</figcaption><img src="${chartBw.canvas.toDataURL("image/png")}" /></figure>
+             <figure><figcaption>Peak side-lobe level</figcaption><img src="${chartPsl.canvas.toDataURL("image/png")}" /></figure>
+           </div>
+         </section>`
+      : "";
+
+  $("report").innerHTML = `
+    <h1>PSF Array Viewer — report</h1>
+    <div class="meta">Generated ${new Date().toLocaleString()}</div>
+
+    <section>
+      <h2>Point spread function</h2>
+      <div class="maps${two ? "" : " single"}">${maps}</div>
+    </section>
+
+    <section>
+      <h2>Metrics</h2>
+      <table>${metricsTableHtml(designs[0], two ? designs[1] : null)}</table>
+    </section>
+
+    ${designs.map((d) => designSectionHtml(d, two ? `Configuration ${d.slot}` : "Configuration")).join("")}
+    ${sweepHtml}
+  `;
+  return true;
+}
+
+function printReport() {
+  if (!buildReport()) return;
+  // Give the browser a tick to lay out the freshly-injected images.
+  setTimeout(() => window.print(), 60);
+}
+
+$("snap-a").addEventListener("click", () => takeSnapshot("A"));
+$("snap-b").addEventListener("click", () => takeSnapshot("B"));
+$("compare-open").addEventListener("click", openCompare);
+$("compare-close").addEventListener("click", closeCompare);
+$("compare-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "compare-overlay") closeCompare();
+});
+$("ab-clear").addEventListener("click", () => {
+  snapshots.A = null;
+  snapshots.B = null;
+  updateSnapStatus();
+  closeCompare();
+});
+$("report-btn").addEventListener("click", printReport);
+$("ab-report").addEventListener("click", () => {
+  closeCompare();
+  printReport();
 });
 
 // ───────────────────────── readouts ─────────────────────────

@@ -348,6 +348,19 @@
         </section>
 
         <section class="group">
+          <div class="eyebrow">Compare</div>
+          <div class="field grid2">
+            <button class="file-btn" id="snap-a">Snapshot A</button>
+            <button class="file-btn" id="snap-b">Snapshot B</button>
+          </div>
+          <p class="hint" id="snap-status">Capture the current design into a slot, change the setup, then capture the other slot.</p>
+          <div class="field grid2">
+            <button class="file-btn" id="compare-open" disabled>Compare…</button>
+            <button class="file-btn" id="report-btn">Report (PDF)</button>
+          </div>
+        </section>
+
+        <section class="group">
           <div class="eyebrow">Configuration</div>
           <div class="field grid2">
             <button class="file-btn" id="config-save">Save…</button>
@@ -448,6 +461,32 @@
         </div>
       </div>
     </div>
+
+    <!-- ───────────────────────── A/B compare modal ───────────────────────── -->
+    <div class="modal-overlay" id="compare-overlay" hidden>
+      <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="compare-title">
+        <div class="modal-head">
+          <h2 id="compare-title">A / B comparison</h2>
+          <button class="modal-close" id="compare-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="ab-maps">
+            <figure><figcaption id="ab-cap-a">A</figcaption><img id="ab-img-a" alt="PSF map, design A" /></figure>
+            <figure><figcaption id="ab-cap-b">B</figcaption><img id="ab-img-b" alt="PSF map, design B" /></figure>
+          </div>
+          <table class="ab-table" id="ab-table"></table>
+          <div class="chart-title" id="ab-cut-title" hidden>Line cuts through the peak</div>
+          <div class="chart-host" id="chart-ab" hidden></div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="ab-clear">Clear slots</button>
+          <button class="file-btn" id="ab-report">Report (PDF)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── printable report ───────────────────────── -->
+    <div id="report" aria-hidden="true"></div>
 
     <!-- ───────────────────────── mic editor modal ───────────────────────── -->
     <div class="modal-overlay" id="mic-overlay" hidden>
