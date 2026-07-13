@@ -127,6 +127,15 @@ pub enum ArraySource {
     },
     /// Positions parsed from CSV text (3 columns x,y,z; optional 4th = weight).
     Csv { text: String },
+    /// An explicit, hand-edited microphone layout. Any generated array becomes a
+    /// `Manual` one as soon as the user drags a microphone in the editor, so the
+    /// edit survives save/load instead of being clobbered by the generator.
+    Manual {
+        pos: Vec<[f64; 3]>,
+        /// Optional per-mic weights (overriding the shading window), as for CSV.
+        #[serde(default)]
+        weights: Option<Vec<f64>>,
+    },
 }
 
 /// Resolved microphone layout.
@@ -280,6 +289,23 @@ pub fn build_array(src: &ArraySource) -> Result<Array, String> {
             })
         }
         ArraySource::Csv { text } => parse_csv(text),
+        ArraySource::Manual { pos, weights } => {
+            if pos.is_empty() {
+                return Err("Array needs at least one microphone.".into());
+            }
+            if !pos.iter().all(|p| p.iter().all(|c| c.is_finite())) {
+                return Err("Microphone positions must be finite numbers.".into());
+            }
+            if let Some(w) = weights {
+                if w.len() != pos.len() {
+                    return Err("Manual array: one weight per microphone is required.".into());
+                }
+            }
+            Ok(Array {
+                pos: pos.clone(),
+                csv_weights: weights.clone(),
+            })
+        }
     }
 }
 
@@ -470,155 +496,413 @@ impl Source {
     }
 }
 
+// ─────────────────────────────────────────────────────────── algorithm
+
+/// Which beamforming algorithm forms the map.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Algorithm {
+    /// Conventional delay-and-sum: `P = Σ_s |hᴴgₛ|²`.
+    Conventional,
+    /// Functional beamforming (Dougherty): `P = (hᴴ·C^{1/ν}·h)^ν`. Raising the
+    /// exponent `nu` sharpens the main lobe and pushes side lobes down.
+    /// At `nu = 1` this is identically the conventional map.
+    Functional { nu: f64 },
+}
+
+impl Default for Algorithm {
+    fn default() -> Self {
+        Algorithm::Conventional
+    }
+}
+
+/// Physics + algorithm settings shared by every beamformer entry point.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct BeamformOptions {
+    pub frequency: f64,
+    pub speed_of_sound: f64,
+    #[serde(default)]
+    pub formulation: SteeringFormulation,
+    /// Subtract the autopower (diagonal) terms. Conventional only — functional
+    /// beamforming's low-rank route never materialises a diagonal to strip.
+    #[serde(default)]
+    pub diag_removal: bool,
+    /// Per-sensor white-noise variance σ² (0 = off).
+    #[serde(default)]
+    pub noise_power: f64,
+    #[serde(default)]
+    pub algorithm: Algorithm,
+}
+
+// ─────────────────────────────────────────── small complex linear algebra
+//
+// Used only by functional beamforming, and only on an S×S matrix where S is the
+// source count (a handful). Deliberately tiny and self-contained: no LAPACK/BLAS
+// system dependency, which would dwarf this binary.
+
+type Cx = (f64, f64);
+
+#[inline]
+fn cadd(a: Cx, b: Cx) -> Cx {
+    (a.0 + b.0, a.1 + b.1)
+}
+#[inline]
+fn cmul(a: Cx, b: Cx) -> Cx {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+#[inline]
+fn cconj(a: Cx) -> Cx {
+    (a.0, -a.1)
+}
+
+/// Jacobi eigendecomposition of a small complex Hermitian matrix `a` (`n`×`n`,
+/// row-major). Returns `(eigenvalues, eigenvectors)` with eigenvector `i` held in
+/// **column** `i` of the returned matrix.
+///
+/// Each sweep zeroes the off-diagonal with unitary rotations
+/// `U = [[c, −s·e^{iφ}], [s·e^{−iφ}, c]]`, choosing `tan 2θ = 2|a_pq| / (a_pp − a_qq)`.
+/// `n` is the source count, and this runs once per compute — never per scan point.
+fn hermitian_eig(a_in: &[Cx], n: usize) -> (Vec<f64>, Vec<Cx>) {
+    let mut a = a_in.to_vec();
+    let mut v = vec![(0.0, 0.0); n * n];
+    for i in 0..n {
+        v[i * n + i] = (1.0, 0.0);
+    }
+    if n <= 1 {
+        return ((0..n).map(|i| a[i * n + i].0).collect(), v);
+    }
+
+    for _ in 0..60 {
+        let mut off = 0.0f64;
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    off += a[i * n + j].0 * a[i * n + j].0 + a[i * n + j].1 * a[i * n + j].1;
+                }
+            }
+        }
+        if off.sqrt() <= 1e-13 {
+            break;
+        }
+
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let apq = a[p * n + q];
+                let r = (apq.0 * apq.0 + apq.1 * apq.1).sqrt();
+                if r <= 1e-18 {
+                    continue;
+                }
+                let app = a[p * n + p].0;
+                let aqq = a[q * n + q].0;
+                let phi = apq.1.atan2(apq.0);
+                let theta = 0.5 * (2.0 * r).atan2(app - aqq);
+                let (c, s) = (theta.cos(), theta.sin());
+                let e_pos = (phi.cos(), phi.sin()); // e^{iφ}
+                let e_neg = (phi.cos(), -phi.sin()); // e^{−iφ}
+                let u_pq = cmul((-s, 0.0), e_pos);
+                let u_qp = cmul((s, 0.0), e_neg);
+
+                // A ← A·U (only columns p, q change)
+                for i in 0..n {
+                    let aip = a[i * n + p];
+                    let aiq = a[i * n + q];
+                    a[i * n + p] = cadd(cmul(aip, (c, 0.0)), cmul(aiq, u_qp));
+                    a[i * n + q] = cadd(cmul(aip, u_pq), cmul(aiq, (c, 0.0)));
+                }
+                // A ← Uᴴ·A (only rows p, q change)
+                let uh_pq = cconj(u_qp);
+                let uh_qp = cconj(u_pq);
+                for j in 0..n {
+                    let apj = a[p * n + j];
+                    let aqj = a[q * n + j];
+                    a[p * n + j] = cadd(cmul((c, 0.0), apj), cmul(uh_pq, aqj));
+                    a[q * n + j] = cadd(cmul(uh_qp, apj), cmul((c, 0.0), aqj));
+                }
+                // V ← V·U (only columns p, q change)
+                for i in 0..n {
+                    let vip = v[i * n + p];
+                    let viq = v[i * n + q];
+                    v[i * n + p] = cadd(cmul(vip, (c, 0.0)), cmul(viq, u_qp));
+                    v[i * n + q] = cadd(cmul(vip, u_pq), cmul(viq, (c, 0.0)));
+                }
+            }
+        }
+    }
+
+    ((0..n).map(|i| a[i * n + i].0).collect(), v)
+}
+
+/// Precomputed functional-beamforming terms, derived once per compute from the
+/// S×S source Gram matrix — never from an N×N cross-spectral matrix.
+///
+/// With `C = G·Gᴴ + σ²I`, the signal subspace has rank ≤ S, so the eigenpairs of
+/// `C` follow from `M = Gᴴ·G` (S×S): if `M·v_i = λ_i·v_i` then `u_i = G·v_i/√λ_i`
+/// is a unit eigenvector of `G·Gᴴ` with eigenvalue `λ_i`, and `C` adds `σ²` to
+/// every eigenvalue. Hence
+///
+/// ```text
+///   hᴴC^{1/ν}h = σ^{2/ν}·‖h‖² + Σ_i [ (λ_i+σ²)^{1/ν} − σ^{2/ν} ] · |u_iᴴh|²
+/// ```
+///
+/// and since `|u_iᴴh|² = |z_i|²/λ_i` with `z_i = Σ_s v_{s,i}·Sₛ`, everything is
+/// expressed through the per-source projections `Sₛ = hᴴgₛ` and `‖h‖² = Σ_m|h_m|²`
+/// that the scan loop already computes.
+struct Functional {
+    nu: f64,
+    /// σ^{2/ν} — the noise subspace's contribution per unit of ‖h‖².
+    base: f64,
+    /// `[(λ_i+σ²)^{1/ν} − σ^{2/ν}] / λ_i`, applied to `|z_i|²`.
+    coef: Vec<f64>,
+    /// S×S eigenvectors, column `i` = `v_i` (row-major).
+    v: Vec<Cx>,
+    n: usize,
+}
+
 // ─────────────────────────────────────────────────────────── beamformer
 
-/// Compute the normalised beamformer map (dB) over the focus grid for one or
-/// more incoherent point `sources`. The cross-spectral matrix is
-/// `C = Σ_s a_s²·gₛ·gₛᴴ` where `gₛ` is source `s`'s free-field pressure
-/// vector at the mics (1/r falloff + phase) and `a_s` its amplitude. The map
-/// is steered with the chosen Sarradj formulation; with a single unit source
-/// this reduces to the classic point-spread function. `sources` need not lie
-/// on the scanned focus plane. With `diag_removal` the CSM diagonal
-/// (autopower) terms are subtracted before forming the beamformer output:
-///   P(t) = Σ_s |hᴴ(t)·gₛ|² − diag_removal · Σ_m |h_m(t)|²·C_mm
-/// Returns row-major values (`v` outer, `u` inner), length `nx*ny`, in dB
-/// relative to the grid's peak value (peak = 0 dB).
-pub fn compute_psf(
+/// Beamform at an arbitrary set of world-space scan `points`, returning the
+/// **raw (un-normalised) linear** beamformer power at each. This is the shared
+/// core of the engine: [`compute_psf`] calls it with a planar grid, but it
+/// accepts any point cloud (e.g. STL surface samples).
+///
+/// No cross-spectral matrix is formed — the output is the incoherent per-source
+/// sum `Σ_s |hᴴ·gₛ|²`, steered with the chosen Sarradj formulation, with
+/// optional per-source diagonal removal (`Σ_m |h_m|²|g_{s,m}|²`) and an optional
+/// white sensor-noise floor. `noise_power` is the per-sensor noise variance σ²
+/// (0 = off); it contributes `σ²·Σ_m |h_m|²` to the output and is stripped again
+/// by `diag_removal` — which is exactly why diagonal removal rejects
+/// uncorrelated sensor noise.
+///
+/// Returning raw power (not dB) lets callers combine maps before normalising —
+/// e.g. incoherent band-averaging over a frequency sweep. Use [`normalize_to_db`]
+/// to convert a raw slice to peak-referenced dB.
+pub fn compute_at_points(
     array: &Array,
     weights: &[f64],
-    focus: &FocusConfig,
+    points: &[[f64; 3]],
     sources: &[Source],
-    frequency: f64,
-    speed_of_sound: f64,
-    formulation: SteeringFormulation,
-    diag_removal: bool,
-) -> Result<(Grid, Vec<f32>), String> {
+    opts: &BeamformOptions,
+) -> Result<Vec<f64>, String> {
     if array.is_empty() {
         return Err("No microphones to compute with.".into());
     }
     if sources.is_empty() {
         return Err("At least one source is required.".into());
     }
-    if frequency <= 0.0 || speed_of_sound <= 0.0 {
+    if opts.frequency <= 0.0 || opts.speed_of_sound <= 0.0 {
         return Err("Frequency and speed of sound must be positive.".into());
     }
-    let grid = focus.grid()?;
-    let (uh, vh, _) = focus.plane.basis();
-    let k = 2.0 * std::f64::consts::PI * frequency / speed_of_sound;
-
+    let formulation = opts.formulation;
+    // Diagonal removal only applies to the conventional map: functional
+    // beamforming reaches C through its low-rank eigenpairs, where there is no
+    // materialised diagonal to strip.
+    let diag_removal = opts.diag_removal && matches!(opts.algorithm, Algorithm::Conventional);
+    let k = 2.0 * std::f64::consts::PI * opts.frequency / opts.speed_of_sound;
     let reference = array.centroid();
     let mics = &array.pos;
     let nsrc = sources.len();
 
-    // Free-field pressure at each mic from each source, laid out mic-major
-    // (`p[m][s]`), plus the CSM diagonal C_mm = Σ_s |p_{s,m}|² per mic.
+    // Free-field complex pressure at each mic from each source, laid out
+    // mic-major (`p[m][s]` = gₛ at mic m). Only this propagation vector is
+    // needed — no cross-spectral matrix (or its diagonal) is ever formed.
     let mut p: Vec<Vec<(f64, f64)>> = Vec::with_capacity(mics.len());
-    let mut cmm: Vec<f64> = Vec::with_capacity(mics.len());
     for m in mics.iter() {
         let mut row = Vec::with_capacity(nsrc);
-        let mut diag = 0.0f64;
         for src in sources {
             let d = dist(*m, src.pos).max(1e-9);
             let phase = -k * d;
             let (s, c) = phase.sin_cos();
             let a = src.amplitude;
-            let pr = a * c / d;
-            let pi = a * s / d;
-            row.push((pr, pi));
-            diag += pr * pr + pi * pi;
+            row.push((a * c / d, a * s / d));
         }
         p.push(row);
-        cmm.push(diag);
     }
 
     let wsum: f64 = weights.iter().sum();
     let wsum_safe = if wsum.abs() < 1e-30 { 1.0 } else { wsum };
     let needs_norm_pass = matches!(formulation, SteeringFormulation::Iii | SteeringFormulation::Iv);
+    let noise = opts.noise_power.max(0.0);
 
-    let mut raw = vec![0f64; grid.nx * grid.ny];
-
-    raw.par_chunks_mut(grid.nx)
-        .enumerate()
-        .for_each(|(j, row)| {
-            let vv = grid.v[j];
-            // Per-source beamformer accumulators, reused across the row.
-            let mut s_re = vec![0f64; nsrc];
-            let mut s_im = vec![0f64; nsrc];
-            for (i, cell) in row.iter_mut().enumerate() {
-                let uu = grid.u[i];
-                let point = add(focus.center, add(scale(uh, uu), scale(vh, vv)));
-                let r0 = dist(reference, point).max(1e-9);
-
-                // III/IV need Σ w_m|x_m|² = Σ w_m·(r0/rm)² up front.
-                let norm_sq_sum = if needs_norm_pass {
-                    let mut s = 0.0f64;
-                    for (m, mic) in mics.iter().enumerate() {
-                        let rm = dist(*mic, point).max(1e-9);
-                        let g = r0 / rm;
-                        s += weights[m] * g * g;
+    // Functional beamforming: derive C's eigenpairs once from the S×S source
+    // Gram matrix M_st = gₛᴴ·g_t. See `Functional` for the derivation.
+    let functional = match opts.algorithm {
+        Algorithm::Conventional => None,
+        Algorithm::Functional { nu } => {
+            let nu = if nu.is_finite() && nu >= 1.0 { nu } else { 1.0 };
+            let mut gram = vec![(0.0f64, 0.0f64); nsrc * nsrc];
+            for s in 0..nsrc {
+                for t in 0..nsrc {
+                    let mut acc = (0.0f64, 0.0f64);
+                    for row in p.iter() {
+                        acc = cadd(acc, cmul(cconj(row[s]), row[t]));
                     }
-                    if s.abs() < 1e-30 { 1.0 } else { s }
-                } else {
-                    1.0
-                };
-                let norm: f64 = match formulation {
-                    SteeringFormulation::I | SteeringFormulation::Ii => wsum_safe,
-                    SteeringFormulation::Iii => norm_sq_sum,
-                    SteeringFormulation::Iv => (wsum_safe.max(0.0) * norm_sq_sum).sqrt(),
-                };
-                let inv_norm = if norm.abs() < 1e-30 { 1.0 } else { 1.0 / norm };
+                    gram[s * nsrc + t] = acc;
+                }
+            }
+            let (lambda, v) = hermitian_eig(&gram, nsrc);
+            let base = noise.powf(1.0 / nu); // σ^{2/ν}  (noise is σ²)
+            let coef = lambda
+                .iter()
+                .map(|&l| {
+                    if l <= 1e-30 {
+                        0.0
+                    } else {
+                        ((l + noise).powf(1.0 / nu) - base) / l
+                    }
+                })
+                .collect();
+            Some(Functional { nu, base, coef, v, n: nsrc })
+        }
+    };
 
-                for v in s_re.iter_mut() {
-                    *v = 0.0;
-                }
-                for v in s_im.iter_mut() {
-                    *v = 0.0;
-                }
-                let mut diag_sum = 0.0f64;
+    let mut raw = vec![0f64; points.len()];
+    // Parallelise over scan points; `for_each_init` hands each worker thread a
+    // reusable set of per-source accumulators so the hot loop never re-allocates.
+    raw.par_iter_mut().zip(points.par_iter()).for_each_init(
+        || (vec![0f64; nsrc], vec![0f64; nsrc], vec![0f64; nsrc]),
+        |(s_re, s_im, s_diag), (cell, point)| {
+            let point = *point;
+            let r0 = dist(reference, point).max(1e-9);
+
+            // III/IV need Σ w_m|x_m|² = Σ w_m·(r0/rm)² up front.
+            let norm_sq_sum = if needs_norm_pass {
+                let mut s = 0.0f64;
                 for (m, mic) in mics.iter().enumerate() {
                     let rm = dist(*mic, point).max(1e-9);
                     let g = r0 / rm;
-                    let phase = -k * (rm - r0);
-                    let (s, c) = phase.sin_cos();
-                    // y_m per formulation (unweighted, unnormalised steering coeff.)
-                    let (y_re, y_im) = match formulation {
-                        SteeringFormulation::I => (c, s),
-                        SteeringFormulation::Ii => (c / g, s / g),
-                        SteeringFormulation::Iii | SteeringFormulation::Iv => (g * c, g * s),
-                    };
-                    let h_re = weights[m] * y_re * inv_norm;
-                    let h_im = weights[m] * y_im * inv_norm;
-                    // Sₛ += conj(h_m) · p_{s,m} for each source.
-                    for (s_idx, &(p_re, p_im)) in p[m].iter().enumerate() {
-                        s_re[s_idx] += h_re * p_re + h_im * p_im;
-                        s_im[s_idx] += h_re * p_im - h_im * p_re;
-                    }
-                    if diag_removal {
-                        diag_sum += (h_re * h_re + h_im * h_im) * cmm[m];
-                    }
+                    s += weights[m] * g * g;
                 }
-                // Incoherent sum of per-source beamformer powers.
-                let mut power = 0.0f64;
-                for s_idx in 0..nsrc {
-                    power += s_re[s_idx] * s_re[s_idx] + s_im[s_idx] * s_im[s_idx];
-                }
-                if diag_removal {
-                    power -= diag_sum;
-                }
-                *cell = power.max(0.0);
+                if s.abs() < 1e-30 { 1.0 } else { s }
+            } else {
+                1.0
+            };
+            let norm: f64 = match formulation {
+                SteeringFormulation::I | SteeringFormulation::Ii => wsum_safe,
+                SteeringFormulation::Iii => norm_sq_sum,
+                SteeringFormulation::Iv => (wsum_safe.max(0.0) * norm_sq_sum).sqrt(),
+            };
+            let inv_norm = if norm.abs() < 1e-30 { 1.0 } else { 1.0 / norm };
+
+            for v in s_re.iter_mut() {
+                *v = 0.0;
             }
-        });
+            for v in s_im.iter_mut() {
+                *v = 0.0;
+            }
+            if diag_removal {
+                for v in s_diag.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            // Σ_m |h_m|² — the array's response to spatially white sensor noise.
+            let mut h_norm2 = 0.0f64;
+            for (m, mic) in mics.iter().enumerate() {
+                let rm = dist(*mic, point).max(1e-9);
+                let g = r0 / rm;
+                let phase = -k * (rm - r0);
+                let (s, c) = phase.sin_cos();
+                // y_m per formulation (unweighted, unnormalised steering coeff.)
+                let (y_re, y_im) = match formulation {
+                    SteeringFormulation::I => (c, s),
+                    SteeringFormulation::Ii => (c / g, s / g),
+                    SteeringFormulation::Iii | SteeringFormulation::Iv => (g * c, g * s),
+                };
+                let h_re = weights[m] * y_re * inv_norm;
+                let h_im = weights[m] * y_im * inv_norm;
+                let h_mag2 = h_re * h_re + h_im * h_im;
+                h_norm2 += h_mag2;
+                // Sₛ += conj(h_m) · g_{s,m}, plus (optionally) the per-source
+                // autopower term Σ_m |h_m|²|g_{s,m}|² for diagonal removal.
+                for (s_idx, &(p_re, p_im)) in p[m].iter().enumerate() {
+                    s_re[s_idx] += h_re * p_re + h_im * p_im;
+                    s_im[s_idx] += h_re * p_im - h_im * p_re;
+                    if diag_removal {
+                        s_diag[s_idx] += h_mag2 * (p_re * p_re + p_im * p_im);
+                    }
+                }
+            }
+            let power = match &functional {
+                // Functional: P = (hᴴC^{1/ν}h)^ν, assembled from the per-source
+                // projections Sₛ and ‖h‖² already in hand — no CSM, no N×N work.
+                Some(ft) => {
+                    let mut acc = ft.base * h_norm2;
+                    for i in 0..ft.n {
+                        // z_i = Σ_s v_{s,i}·Sₛ  ⇒  |u_iᴴh|² = |z_i|²/λ_i
+                        let mut z = (0.0f64, 0.0f64);
+                        for s_idx in 0..ft.n {
+                            z = cadd(z, cmul(ft.v[s_idx * ft.n + i], (s_re[s_idx], s_im[s_idx])));
+                        }
+                        acc += ft.coef[i] * (z.0 * z.0 + z.1 * z.1);
+                    }
+                    acc.max(0.0).powf(ft.nu)
+                }
+                // Conventional: incoherent sum of per-source powers, each with its
+                // own autopower (diagonal) term removed when requested.
+                None => {
+                    let mut power = 0.0f64;
+                    for s_idx in 0..nsrc {
+                        let mut ps = s_re[s_idx] * s_re[s_idx] + s_im[s_idx] * s_im[s_idx];
+                        if diag_removal {
+                            ps -= s_diag[s_idx];
+                        }
+                        power += ps;
+                    }
+                    // White sensor-noise floor σ²·Σ_m|h_m|²: added to the output,
+                    // and stripped again by diagonal removal.
+                    let noise_contrib = noise * h_norm2;
+                    power += noise_contrib;
+                    if diag_removal {
+                        power -= noise_contrib;
+                    }
+                    power
+                }
+            };
+            *cell = power.max(0.0);
+        },
+    );
 
-    // Normalise to the grid's own peak rather than assuming a source sits at
-    // the geometric centre of the scan grid — it may not (see `sources`).
+    Ok(raw)
+}
+
+/// Normalise raw linear power to dB relative to its own peak (peak = 0 dB),
+/// flooring at [`DB_FLOOR`] so a perfect null never yields −∞.
+pub fn normalize_to_db(raw: &[f64]) -> Vec<f32> {
     let p0 = raw.iter().cloned().fold(0.0f64, f64::max).max(1e-30);
-
-    let values: Vec<f32> = raw
-        .iter()
+    raw.iter()
         .map(|&p| (10.0 * (p / p0 + 1e-30).log10()).max(DB_FLOOR as f64) as f32)
-        .collect();
+        .collect()
+}
 
-    Ok((grid, values))
+/// Compute the normalised beamformer map (dB) over the focus grid for one or
+/// more incoherent point `sources`. Thin wrapper over [`compute_at_points`]:
+/// it materialises the focus grid's scan points (row-major, `v` outer, `u`
+/// inner), beamforms them, and normalises to the grid's own peak. See
+/// [`compute_at_points`] for the model, `diag_removal`, and `noise_power`.
+/// Returns row-major values, length `nx*ny`, in dB (peak = 0 dB).
+pub fn compute_psf(
+    array: &Array,
+    weights: &[f64],
+    focus: &FocusConfig,
+    sources: &[Source],
+    opts: &BeamformOptions,
+) -> Result<(Grid, Vec<f32>), String> {
+    let grid = focus.grid()?;
+    let points = grid_points(focus, &grid);
+    let raw = compute_at_points(array, weights, &points, sources, opts)?;
+    Ok((grid, normalize_to_db(&raw)))
+}
+
+/// The focus grid's world-space scan points, row-major (`v` outer, `u` inner) to
+/// match the layout the renderer and metrics expect.
+fn grid_points(focus: &FocusConfig, grid: &Grid) -> Vec<[f64; 3]> {
+    let (uh, vh, _) = focus.plane.basis();
+    let mut points = Vec::with_capacity(grid.nx * grid.ny);
+    for &vv in &grid.v {
+        for &uu in &grid.u {
+            points.push(add(focus.center, add(scale(uh, uu), scale(vh, vv))));
+        }
+    }
+    points
 }
 
 // ─────────────────────────────────────────────────────────── metrics
@@ -778,6 +1062,148 @@ pub fn metrics(array: &Array, grid: &Grid, values: &[f32], frequency_c: f64) -> 
     }
 }
 
+// ─────────────────────────────────────────────────────────── frequency sweep
+
+/// Upper bound on swept frequency points, so a stray UI value cannot wedge the
+/// app with an unbounded amount of work.
+pub const MAX_SWEEP_POINTS: usize = 200;
+
+/// The frequency-dependent metrics at one swept frequency.
+#[derive(Clone, Debug, Serialize)]
+pub struct SweepPoint {
+    pub frequency: f64,
+    pub beamwidth_u: Option<f64>,
+    pub beamwidth_v: Option<f64>,
+    pub peak_sidelobe_db: Option<f32>,
+}
+
+/// Result of a broadband sweep over a fixed array + focus grid.
+#[derive(Clone, Debug, Serialize)]
+pub struct SweepResult {
+    pub points: Vec<SweepPoint>,
+    /// Incoherent (power) band-average of the maps across every swept frequency,
+    /// normalised once to its own peak (dB). `None` unless `band_map` was set.
+    pub band_values: Option<Vec<f32>>,
+    pub nx: usize,
+    pub ny: usize,
+    pub u: Vec<f64>,
+    pub v: Vec<f64>,
+    /// Frequency-independent geometry facts, so callers need not recompute them.
+    pub alias_frequency: Option<f64>,
+    pub aperture: f64,
+    pub n_mics: usize,
+}
+
+/// Build the swept frequency list: `n` points from `f_min` to `f_max`,
+/// logarithmically spaced when `log_spacing` (the useful default in acoustics).
+pub fn sweep_frequencies(
+    f_min: f64,
+    f_max: f64,
+    n: usize,
+    log_spacing: bool,
+) -> Result<Vec<f64>, String> {
+    if n == 0 {
+        return Err("Sweep needs at least one frequency point.".into());
+    }
+    if n > MAX_SWEEP_POINTS {
+        return Err(format!(
+            "Sweep is limited to {MAX_SWEEP_POINTS} frequency points."
+        ));
+    }
+    if !f_min.is_finite() || !f_max.is_finite() || f_min <= 0.0 || f_max <= 0.0 {
+        return Err("Sweep frequencies must be positive.".into());
+    }
+    if f_max < f_min {
+        return Err("Sweep f_max must be at least f_min.".into());
+    }
+    if n == 1 {
+        return Ok(vec![f_min]);
+    }
+    let nn = (n - 1) as f64;
+    Ok((0..n)
+        .map(|i| {
+            let t = i as f64 / nn;
+            if log_spacing {
+                f_min * (f_max / f_min).powf(t)
+            } else {
+                f_min + t * (f_max - f_min)
+            }
+        })
+        .collect())
+}
+
+/// Sweep the beamformer across `frequencies` over a fixed array and focus grid.
+///
+/// Per frequency it records the frequency-dependent metrics (−3 dB beamwidths and
+/// peak side-lobe level). With `band_map` it also accumulates the **raw linear**
+/// power maps and normalises the total once at the end — an incoherent
+/// band-average. Summing raw power (rather than per-frequency dB) is the whole
+/// reason [`compute_at_points`] returns un-normalised power.
+pub fn compute_sweep(
+    array: &Array,
+    weights: &[f64],
+    focus: &FocusConfig,
+    sources: &[Source],
+    frequencies: &[f64],
+    opts: &BeamformOptions,
+    band_map: bool,
+) -> Result<SweepResult, String> {
+    if frequencies.is_empty() {
+        return Err("Sweep needs at least one frequency point.".into());
+    }
+    if frequencies.len() > MAX_SWEEP_POINTS {
+        return Err(format!(
+            "Sweep is limited to {MAX_SWEEP_POINTS} frequency points."
+        ));
+    }
+    let grid = focus.grid()?;
+    let points = grid_points(focus, &grid);
+
+    let mut band = if band_map { vec![0f64; points.len()] } else { Vec::new() };
+    let mut swept = Vec::with_capacity(frequencies.len());
+    // The geometry metrics (aperture, alias frequency, mic count) do not depend
+    // on frequency — capture them once from the first pass.
+    let mut geometry: Option<Metrics> = None;
+
+    for &f in frequencies {
+        let step = BeamformOptions { frequency: f, ..*opts };
+        let raw = compute_at_points(array, weights, &points, sources, &step)?;
+        if band_map {
+            for (b, r) in band.iter_mut().zip(raw.iter()) {
+                *b += *r;
+            }
+        }
+        let values = normalize_to_db(&raw);
+        let m = metrics(array, &grid, &values, opts.speed_of_sound);
+        swept.push(SweepPoint {
+            frequency: f,
+            beamwidth_u: m.beamwidth_u,
+            beamwidth_v: m.beamwidth_v,
+            peak_sidelobe_db: m.peak_sidelobe_db,
+        });
+        if geometry.is_none() {
+            geometry = Some(m);
+        }
+    }
+
+    let geom = geometry.unwrap_or_default();
+    Ok(SweepResult {
+        points: swept,
+        band_values: if band_map {
+            Some(normalize_to_db(&band))
+        } else {
+            None
+        },
+        nx: grid.nx,
+        ny: grid.ny,
+        u: grid.u,
+        v: grid.v,
+        alias_frequency: geom.alias_frequency,
+        aperture: geom.aperture,
+        n_mics: geom.n_mics,
+    })
+}
+
 // ─────────────────────────────────────────────────────────── tests
 
 #[cfg(test)]
@@ -874,6 +1300,27 @@ mod tests {
         assert!(a.csv_weights.is_none());
     }
 
+    #[test]
+    fn manual_array_round_trips_positions_and_weights() {
+        let a = build_array(&ArraySource::Manual {
+            pos: vec![[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+            weights: Some(vec![1.0, 0.5, 0.25]),
+        })
+        .unwrap();
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.csv_weights.as_ref().unwrap()[2], 0.25);
+        // Explicit weights win over the shading window, as with CSV.
+        assert_eq!(weights_for(&a, Shading::Hann)[1], 0.5);
+
+        // Weights, when given, must match the mic count.
+        assert!(build_array(&ArraySource::Manual {
+            pos: vec![[0.0, 0.0, 0.0]],
+            weights: Some(vec![1.0, 1.0]),
+        })
+        .is_err());
+        assert!(build_array(&ArraySource::Manual { pos: vec![], weights: None }).is_err());
+    }
+
     fn focus() -> FocusConfig {
         FocusConfig {
             center: [0., 0., 1.0],
@@ -881,6 +1328,19 @@ mod tests {
             width: 1.0,
             height: 1.0,
             dx: 0.02,
+        }
+    }
+
+    /// Baseline beamformer settings; override fields with struct-update syntax,
+    /// e.g. `BeamformOptions { diag_removal: true, ..opts(5000.0) }`.
+    fn opts(frequency: f64) -> BeamformOptions {
+        BeamformOptions {
+            frequency,
+            speed_of_sound: 343.0,
+            formulation: SteeringFormulation::I,
+            diag_removal: false,
+            noise_power: 0.0,
+            algorithm: Algorithm::Conventional,
         }
     }
 
@@ -893,10 +1353,7 @@ mod tests {
             &w,
             &focus(),
             &[Source::unit(focus().center)],
-            5000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(5000.0),
         )
         .unwrap();
         let cx = g.nx / 2;
@@ -917,10 +1374,7 @@ mod tests {
             &w,
             &focus(),
             &[Source::unit(focus().center)],
-            4000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(4000.0),
         )
         .unwrap();
         // The full sunflower isn't perfectly mirror-symmetric, but the central
@@ -938,12 +1392,10 @@ mod tests {
         let w = weights_for(&a, Shading::Uniform);
         let f = focus();
         let (g1, v1) =
-            compute_psf(&a, &w, &f, &[Source::unit(f.center)],2000.0, 343.0, SteeringFormulation::I, false)
-                .unwrap();
+            compute_psf(&a, &w, &f, &[Source::unit(f.center)], &opts(2000.0)).unwrap();
         let m1 = metrics(&a, &g1, &v1, 343.0);
         let (g2, v2) =
-            compute_psf(&a, &w, &f, &[Source::unit(f.center)],8000.0, 343.0, SteeringFormulation::I, false)
-                .unwrap();
+            compute_psf(&a, &w, &f, &[Source::unit(f.center)], &opts(8000.0)).unwrap();
         let m2 = metrics(&a, &g2, &v2, 343.0);
         let b1 = m1.beamwidth_u.unwrap();
         let b2 = m2.beamwidth_u.unwrap();
@@ -976,10 +1428,7 @@ mod tests {
             &weights_for(&a, Shading::Uniform),
             &f,
             &src,
-            6000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(6000.0),
         )
         .unwrap();
         let (gh, vh) = compute_psf(
@@ -987,10 +1436,7 @@ mod tests {
             &weights_for(&a, Shading::Hann),
             &f,
             &src,
-            6000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(6000.0),
         )
         .unwrap();
         let psl_u = metrics(&a, &gu, &vu, 343.0).peak_sidelobe_db;
@@ -1009,10 +1455,7 @@ mod tests {
             &w,
             &focus(),
             &[Source::unit(focus().center)],
-            3000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(3000.0),
         )
         .unwrap();
         let m = metrics(&a, &g, &v, 343.0);
@@ -1048,10 +1491,7 @@ mod tests {
                     &w,
                     &near_focus(),
                     &[Source::unit(near_focus().center)],
-                    4000.0,
-                    343.0,
-                    formulation,
-                    diag_removal,
+                    &BeamformOptions { formulation, diag_removal, ..opts(4000.0) },
                 )
                 .unwrap();
                 let center = vals[(g.ny / 2) * g.nx + (g.nx / 2)];
@@ -1079,10 +1519,7 @@ mod tests {
             &w,
             &near_focus(),
             &[Source::unit(near_focus().center)],
-            4000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(4000.0),
         )
         .unwrap();
         let (_, v3) = compute_psf(
@@ -1090,10 +1527,7 @@ mod tests {
             &w,
             &near_focus(),
             &[Source::unit(near_focus().center)],
-            4000.0,
-            343.0,
-            SteeringFormulation::Iii,
-            false,
+            &BeamformOptions { formulation: SteeringFormulation::Iii, ..opts(4000.0) },
         )
         .unwrap();
         let max_diff = v1
@@ -1120,10 +1554,7 @@ mod tests {
             &w,
             &near_focus(),
             &[Source::unit(near_focus().center)],
-            4000.0,
-            343.0,
-            SteeringFormulation::I,
-            true,
+            &BeamformOptions { diag_removal: true, ..opts(4000.0) },
         )
         .unwrap();
         assert!(vals.iter().all(|v| v.is_finite() && *v <= 1e-3));
@@ -1141,8 +1572,7 @@ mod tests {
         let f = focus();
 
         let (g0, v0) =
-            compute_psf(&a, &w, &f, &[Source::unit(f.center)],5000.0, 343.0, SteeringFormulation::I, false)
-                .unwrap();
+            compute_psf(&a, &w, &f, &[Source::unit(f.center)], &opts(5000.0)).unwrap();
         let peak0 = v0
             .iter()
             .enumerate()
@@ -1155,8 +1585,7 @@ mod tests {
         // in x) — the peak must move with it, not stay at the grid centre.
         let offset_source = [0.3, 0.0, 1.0];
         let (g1, v1) =
-            compute_psf(&a, &w, &f, &[Source::unit(offset_source)], 5000.0, 343.0, SteeringFormulation::I, false)
-                .unwrap();
+            compute_psf(&a, &w, &f, &[Source::unit(offset_source)], &opts(5000.0)).unwrap();
         let peak1 = v1
             .iter()
             .enumerate()
@@ -1205,10 +1634,7 @@ mod tests {
             &w,
             &f,
             &sources,
-            8000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(8000.0),
         )
         .unwrap();
         let left = v[cell_at(&g, -0.3, 0.0)];
@@ -1242,10 +1668,7 @@ mod tests {
             &w,
             &f,
             &quiet,
-            8000.0,
-            343.0,
-            SteeringFormulation::I,
-            false,
+            &opts(8000.0),
         )
         .unwrap();
         let left = v[cell_at(&g, -0.3, 0.0)]; // loud → normalised peak ≈ 0 dB
@@ -1255,5 +1678,305 @@ mod tests {
             right < left - 10.0,
             "0.1-amplitude source should be ~20 dB down, got {right} dB vs {left} dB"
         );
+    }
+
+    #[test]
+    fn compute_at_points_matches_grid_path() {
+        // R1 regression: compute_psf must be exactly compute_at_points over the
+        // focus grid points followed by normalisation. Rebuild the same points
+        // and compare the resulting dB maps cell-for-cell.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let src = [Source::unit(f.center)];
+        let (g, via_psf) = compute_psf(&a, &w, &f, &src, &opts(5000.0)).unwrap();
+
+        let (uh, vh, _) = f.plane.basis();
+        let mut pts = Vec::with_capacity(g.nx * g.ny);
+        for &vv in &g.v {
+            for &uu in &g.u {
+                pts.push(add(f.center, add(scale(uh, uu), scale(vh, vv))));
+            }
+        }
+        let raw = compute_at_points(&a, &w, &pts, &src, &opts(5000.0)).unwrap();
+        let via_points = normalize_to_db(&raw);
+
+        assert_eq!(via_psf.len(), via_points.len());
+        for (x, y) in via_psf.iter().zip(via_points.iter()) {
+            assert!((x - y).abs() < 1e-6, "grid vs points mismatch: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn sensor_noise_raises_floor_without_diagonal_removal() {
+        // A white sensor-noise floor adds σ²·Σ_m|h_m|² everywhere; where the
+        // source power vanishes (nulls) this term dominates, lifting the map's
+        // floor well above the noiseless case (whose nulls sink to DB_FLOOR).
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let src = [Source::unit(f.center)];
+        let (_, quiet) = compute_psf(&a, &w, &f, &src, &opts(5000.0)).unwrap();
+        let (_, noisy) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &src,
+            &BeamformOptions { noise_power: 1e-2, ..opts(5000.0) },
+        )
+        .unwrap();
+        let min_quiet = quiet.iter().cloned().fold(f32::INFINITY, f32::min);
+        let min_noisy = noisy.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            min_noisy > min_quiet + 1.0,
+            "sensor noise should lift the map floor: {min_noisy} !> {min_quiet}"
+        );
+        // The source peak is still the 0 dB reference.
+        let max_noisy = noisy.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(max_noisy.abs() < 1e-3, "peak should stay at 0 dB, got {max_noisy}");
+    }
+
+    #[test]
+    fn diagonal_removal_cancels_sensor_noise() {
+        // Uncorrelated sensor noise lives entirely on the CSM diagonal, so with
+        // diagonal removal on, adding a noise floor must leave the map unchanged.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let src = [Source::unit(f.center)];
+        let (_, no_noise) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &src,
+            &BeamformOptions { diag_removal: true, ..opts(5000.0) },
+        )
+        .unwrap();
+        let (_, with_noise) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &src,
+            &BeamformOptions { diag_removal: true, noise_power: 1e-2, ..opts(5000.0) },
+        )
+        .unwrap();
+        let max_diff = no_noise
+            .iter()
+            .zip(with_noise.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "diagonal removal should cancel sensor noise, max diff {max_diff}"
+        );
+    }
+
+    #[test]
+    fn sweep_frequencies_span_the_range() {
+        let lin = sweep_frequencies(1000.0, 5000.0, 5, false).unwrap();
+        assert_eq!(lin.len(), 5);
+        assert!((lin[0] - 1000.0).abs() < 1e-9);
+        assert!((lin[4] - 5000.0).abs() < 1e-9);
+        assert!((lin[2] - 3000.0).abs() < 1e-9, "linear midpoint: {}", lin[2]);
+
+        let log = sweep_frequencies(1000.0, 10000.0, 3, true).unwrap();
+        assert!((log[0] - 1000.0).abs() < 1e-9);
+        assert!((log[2] - 10000.0).abs() < 1e-6);
+        // Log midpoint of a decade is the geometric mean.
+        assert!((log[1] - 3162.277).abs() < 0.1, "log midpoint: {}", log[1]);
+
+        assert!(sweep_frequencies(1000.0, 500.0, 4, true).is_err());
+        assert!(sweep_frequencies(0.0, 500.0, 4, true).is_err());
+        assert!(sweep_frequencies(100.0, 500.0, MAX_SWEEP_POINTS + 1, true).is_err());
+    }
+
+    #[test]
+    fn sweep_tracks_beamwidth_against_frequency() {
+        // The main lobe must narrow as frequency rises — the sweep should show
+        // that trend end-to-end, which is the whole point of the feature.
+        let a = build_array(&sunflower(81, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let freqs = sweep_frequencies(2000.0, 8000.0, 5, true).unwrap();
+        let sweep = compute_sweep(
+            &a,
+            &w,
+            &focus(),
+            &[Source::unit(focus().center)],
+            &freqs,
+            // `frequency` here is a placeholder — compute_sweep overrides it per step.
+            &opts(1000.0),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(sweep.points.len(), 5);
+        assert!(sweep.band_values.is_none(), "band map was not requested");
+        assert_eq!(sweep.n_mics, 81);
+        assert!(sweep.alias_frequency.unwrap() > 0.0);
+
+        let first = sweep.points.first().unwrap().beamwidth_u.unwrap();
+        let last = sweep.points.last().unwrap().beamwidth_u.unwrap();
+        assert!(last < first, "beam should narrow with frequency: {first} -> {last}");
+    }
+
+    #[test]
+    fn sweep_band_average_is_a_valid_normalised_map() {
+        // The band map is an incoherent power sum across the band, normalised
+        // once — so it must peak at 0 dB and stay finite everywhere.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let freqs = sweep_frequencies(3000.0, 6000.0, 4, true).unwrap();
+        let sweep = compute_sweep(
+            &a,
+            &w,
+            &f,
+            &[Source::unit(f.center)],
+            &freqs,
+            &opts(1000.0), // overridden per sweep step
+            true,
+        )
+        .unwrap();
+
+        let band = sweep.band_values.expect("band map was requested");
+        assert_eq!(band.len(), sweep.nx * sweep.ny);
+        assert!(band.iter().all(|v| v.is_finite()));
+        let peak = band.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(peak.abs() < 1e-3, "band map should peak at 0 dB, got {peak}");
+        // The source sits at the grid centre, so the band peak belongs there too.
+        let centre = band[(sweep.ny / 2) * sweep.nx + (sweep.nx / 2)];
+        assert!(centre.abs() < 1e-3, "band peak should be at the source: {centre}");
+    }
+
+    // ── functional beamforming ──
+
+    #[test]
+    fn hermitian_eig_diagonalises_a_known_matrix() {
+        // [[2, i], [−i, 2]] is Hermitian with eigenvalues 1 and 3.
+        let a = vec![(2.0, 0.0), (0.0, 1.0), (0.0, -1.0), (2.0, 0.0)];
+        let (mut lambda, v) = hermitian_eig(&a, 2);
+        lambda.sort_by(f64::total_cmp);
+        assert!((lambda[0] - 1.0).abs() < 1e-9, "λ0 = {}", lambda[0]);
+        assert!((lambda[1] - 3.0).abs() < 1e-9, "λ1 = {}", lambda[1]);
+        // Eigenvectors must be unit-norm (columns of V).
+        for i in 0..2 {
+            let n: f64 = (0..2).map(|s| {
+                let c = v[s * 2 + i];
+                c.0 * c.0 + c.1 * c.1
+            }).sum();
+            assert!((n - 1.0).abs() < 1e-9, "eigenvector {i} not unit: {n}");
+        }
+    }
+
+    #[test]
+    fn functional_nu_one_is_exactly_conventional() {
+        // C^{1/1} = C, so functional beamforming at ν = 1 must reproduce the
+        // conventional map bit-for-bit (within float noise). This is the anchor
+        // that validates the whole low-rank S×S route.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        // Several sources, so the Gram matrix is genuinely S×S (not trivial).
+        let src = [
+            Source::unit([-0.25, 0.1, 1.0]),
+            Source { pos: [0.3, -0.2, 1.0], amplitude: 0.6 },
+            Source::unit([0.0, 0.35, 1.0]),
+        ];
+        for noise in [0.0, 1e-3] {
+            let (_, conventional) = compute_psf(
+                &a,
+                &w,
+                &f,
+                &src,
+                &BeamformOptions { noise_power: noise, ..opts(5000.0) },
+            )
+            .unwrap();
+            let (_, functional) = compute_psf(
+                &a,
+                &w,
+                &f,
+                &src,
+                &BeamformOptions {
+                    noise_power: noise,
+                    algorithm: Algorithm::Functional { nu: 1.0 },
+                    ..opts(5000.0)
+                },
+            )
+            .unwrap();
+            let max_diff = conventional
+                .iter()
+                .zip(functional.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-2,
+                "functional(ν=1) should equal conventional (noise={noise}), max diff {max_diff} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_sharpens_the_map() {
+        // Raising ν pushes side lobes down and narrows the main lobe — that is
+        // the entire point of the algorithm.
+        let a = build_array(&sunflower(64, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let src = [Source::unit(f.center)];
+
+        let (g1, v1) = compute_psf(&a, &w, &f, &src, &opts(5000.0)).unwrap();
+        let (g2, v2) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &src,
+            &BeamformOptions { algorithm: Algorithm::Functional { nu: 16.0 }, ..opts(5000.0) },
+        )
+        .unwrap();
+
+        assert!(v2.iter().all(|v| v.is_finite()), "functional produced a non-finite value");
+        // Still peaks at the source, at 0 dB.
+        let centre = v2[(g2.ny / 2) * g2.nx + (g2.nx / 2)];
+        assert!(centre.abs() < 1e-3, "functional peak should be 0 dB, got {centre}");
+
+        let m1 = metrics(&a, &g1, &v1, 343.0);
+        let m2 = metrics(&a, &g2, &v2, 343.0);
+        assert!(
+            m2.beamwidth_u.unwrap() < m1.beamwidth_u.unwrap(),
+            "ν=16 should narrow the main lobe: {:?} -> {:?}",
+            m1.beamwidth_u,
+            m2.beamwidth_u
+        );
+        if let (Some(p1), Some(p2)) = (m1.peak_sidelobe_db, m2.peak_sidelobe_db) {
+            assert!(p2 < p1, "ν=16 should lower the peak side lobe: {p1} -> {p2}");
+        }
+    }
+
+    #[test]
+    fn functional_ignores_diagonal_removal() {
+        // Diagonal removal is conventional-only; asking for it alongside
+        // functional must not change the functional map.
+        let a = build_array(&sunflower(48, 1.0)).unwrap();
+        let w = weights_for(&a, Shading::Uniform);
+        let f = focus();
+        let src = [Source::unit(f.center)];
+        let algorithm = Algorithm::Functional { nu: 8.0 };
+
+        let (_, plain) =
+            compute_psf(&a, &w, &f, &src, &BeamformOptions { algorithm, ..opts(5000.0) }).unwrap();
+        let (_, with_dr) = compute_psf(
+            &a,
+            &w,
+            &f,
+            &src,
+            &BeamformOptions { algorithm, diag_removal: true, ..opts(5000.0) },
+        )
+        .unwrap();
+        let max_diff = plain
+            .iter()
+            .zip(with_dr.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-6, "diag removal must not affect functional: {max_diff}");
     }
 }

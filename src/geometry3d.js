@@ -5,6 +5,8 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { rgbLut, lutColor } from "./colormap.js";
 
 // Lazy-load the path tracer so the app works without the package
 let PathTracerModule = null;
@@ -156,6 +158,7 @@ export class Geometry3D {
     this.sourceMesh   = null;
     this.gridHelper   = null;
     this.axes         = null;
+    this.stlMesh      = null;   // optional loaded STL model
 
     // State
     this._framed    = false;
@@ -388,6 +391,97 @@ export class Geometry3D {
         sp.visible = false;
       }
     }
+    this._markDirty();
+  }
+
+  // ── STL model ─────────────────────────────────────────────────
+  // Load an STL and (optionally) paint the PSF onto its surface. The mesh is
+  // de-indexed into per-vertex positions so every vertex can carry its own
+  // colour; `surfacePoints()` hands those world-space vertices to the engine,
+  // and `setSurfaceLevels()` paints the returned dB values back onto them.
+
+  /** Parse STL bytes and add the mesh. `scale` converts model units → metres. */
+  loadSTL(arrayBuffer, scale = 1.0) {
+    const geo = new STLLoader().parse(arrayBuffer);
+    this.clearSTL();
+
+    geo.scale(scale, scale, scale);
+    geo.computeVertexNormals();
+    // Ensure non-indexed so each triangle vertex has its own colour slot.
+    const g = geo.index ? geo.toNonIndexed() : geo;
+
+    const n = g.getAttribute("position").count;
+    g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3).fill(0.6), 3));
+
+    const mat = new THREE.MeshPhysicalMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      roughness: 0.55,
+      metalness: 0.0,
+      clearcoat: 0.25,
+    });
+    this.stlMesh = new THREE.Mesh(g, mat);
+    this.stlMesh.castShadow = true;
+    this.stlMesh.receiveShadow = true;
+    this.scene.add(this.stlMesh);
+    this._markDirty();
+    return n;
+  }
+
+  clearSTL() {
+    if (!this.stlMesh) return;
+    this.scene.remove(this.stlMesh);
+    this.stlMesh.geometry.dispose();
+    this.stlMesh.material.dispose();
+    this.stlMesh = null;
+    this._markDirty();
+  }
+
+  setSTLVisible(visible) {
+    if (this.stlMesh) this.stlMesh.visible = visible;
+    this._markDirty();
+  }
+
+  /**
+   * The mesh's world-space vertices, thinned to at most `budget` points, plus the
+   * index map needed to paint the results back. Evaluating the beamformer at every
+   * vertex of a real STL would be far too slow, so we sample a stride and give each
+   * skipped vertex the level of its nearest kept sample.
+   */
+  surfacePoints(budget = 4000) {
+    if (!this.stlMesh) return null;
+    const pos = this.stlMesh.geometry.getAttribute("position");
+    const total = pos.count;
+    const stride = Math.max(1, Math.ceil(total / budget));
+    const points = [];
+    // vertex i takes its colour from sample index `Math.floor(i / stride)`
+    for (let i = 0; i < total; i += stride) {
+      points.push([pos.getX(i), pos.getY(i), pos.getZ(i)]);
+    }
+    return { points, stride, total };
+  }
+
+  /** Paint dB levels (one per sampled point) onto the mesh's vertex colours. */
+  setSurfaceLevels(values, stride, dynamicDb, colormap) {
+    if (!this.stlMesh) return;
+    const lut = rgbLut(colormap);
+    const color = this.stlMesh.geometry.getAttribute("color");
+    const total = color.count;
+    for (let i = 0; i < total; i++) {
+      const s = Math.min(values.length - 1, Math.floor(i / stride));
+      const [r, g, b] = lutColor(lut, values[s], dynamicDb);
+      color.setXYZ(i, r, g, b);
+    }
+    color.needsUpdate = true;
+    this._markDirty();
+  }
+
+  /** Reset the mesh to a neutral grey (PSF painting switched off). */
+  clearSurfaceLevels() {
+    if (!this.stlMesh) return;
+    const color = this.stlMesh.geometry.getAttribute("color");
+    for (let i = 0; i < color.count; i++) color.setXYZ(i, 0.6, 0.6, 0.6);
+    color.needsUpdate = true;
     this._markDirty();
   }
 

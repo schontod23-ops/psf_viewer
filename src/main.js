@@ -1,6 +1,8 @@
 import "./style.css";
 import { PSFPlot } from "./psfplot.js";
 import { Geometry3D } from "./geometry3d.js";
+import { LineChart, CHART_PALETTE } from "./linechart.js";
+import { MicEditor } from "./micedit.js";
 
 // ───────────────────────── Tauri detection ─────────────────────────
 const isTauri = !!(window.__TAURI_INTERNALS__ || window.__TAURI__);
@@ -33,6 +35,9 @@ const state = {
   acenter: [0, 0, 0],
   csvText: null,
   csvName: null,
+  // hand-edited layout (source === "manual"); survives save/load
+  manualPos: null,
+  manualWeights: null,
   fplane: "xy",
   fcenter: [0, 0, 1],
   width: 1,
@@ -42,10 +47,17 @@ const state = {
   c: 343,
   shading: "uniform",
   steering: "I",
+  // beamforming algorithm: "conventional" | "functional" (exponent nu)
+  algorithm: "conventional",
+  nu: 16,
   diagRemoval: false,
+  // optional white sensor-noise floor: σ² = 10^(noiseDb/10) when enabled
+  noiseEnabled: false,
+  noiseDb: -40,
   dyn: 30,
   levels: 10,
   lines: true,
+  cut: false,
   colormap: "turbo",
   // source marker (primary source)
   srcPos: [0, 0, 1],
@@ -55,7 +67,23 @@ const state = {
   // 3D options
   multiplane: false,
   raytrace: false,
+  // STL model (the geometry itself is not persisted — only how to interpret it)
+  stlName: null,
+  stlScale: 1,
+  stlPsf: false,
+  // broadband sweep
+  sweepFmin: 1000,
+  sweepFmax: 10000,
+  sweepPoints: 24,
+  sweepLog: true,
+  sweepBand: true,
+  showBand: false,
 };
+
+// Last sweep result (not persisted — it is derived and can be large).
+let lastSweep = null;
+// Mirrors psf_core::MAX_SWEEP_POINTS.
+const MAX_SWEEP_POINTS = 200;
 
 // ───────────────────────── views ─────────────────────────
 const plot = new PSFPlot(document.getElementById("plot"));
@@ -109,6 +137,8 @@ bindSlider("dx", "dx", (v) => `${v.toFixed(3)} m`);
 bindSlider("frequency", "frequency", (v) => `${v | 0} Hz`);
 bindSlider("dyn", "dyn", (v) => `${v | 0} dB`);
 bindSlider("levels", "levels", (v) => `${v | 0}`);
+bindSlider("noise", "noiseDb", (v) => `${v | 0} dB`);
+bindSlider("nu", "nu", (v) => `${v | 0}`);
 
 // ───────────────────────── slider bounds settings ─────────────────────────
 // Per-slider min/max/step, editable at runtime and persisted so users can
@@ -175,7 +205,15 @@ $("settings-overlay").addEventListener("click", (e) => {
   if (e.target.id === "settings-overlay") closeSettings();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("settings-overlay").hidden) closeSettings();
+  if (e.key !== "Escape") return;
+  if (!$("settings-overlay").hidden) closeSettings();
+  else if (!$("sweep-overlay").hidden) $("sweep-overlay").hidden = true;
+  else if (!$("compare-overlay").hidden) closeCompare();
+  // The editor's own canvas uses Esc to clear its selection, so only close the
+  // dialog when the canvas does not have focus.
+  else if (!$("mic-overlay").hidden && document.activeElement !== (micEditor && micEditor.canvas)) {
+    $("mic-overlay").hidden = true;
+  }
 });
 
 $("settings-apply").addEventListener("click", () => {
@@ -335,6 +373,12 @@ $("diag-removal").addEventListener("change", (e) => {
   schedule();
 });
 
+$("noise-enable").addEventListener("change", (e) => {
+  state.noiseEnabled = e.target.checked;
+  $("noise-field").hidden = !state.noiseEnabled;
+  schedule();
+});
+
 $("lines").addEventListener("change", (e) => {
   state.lines = e.target.checked;
   if (lastResults.xy) drawPlot(lastResults[state.fplane] || lastResults.xy);
@@ -350,10 +394,22 @@ document.querySelectorAll(".seg").forEach((seg) => {
       state[key] = btn.dataset.val;
       if (key === "source") updateSourceVisibility();
       if (key === "steering") $("lab-steering").textContent = `Formulation ${btn.dataset.val}`;
+      if (key === "algorithm") updateAlgorithmUI();
       schedule();
     });
   });
 });
+
+// Functional beamforming exposes the ν exponent and has no diagonal to remove,
+// so the diagonal-removal toggle is disabled while it is selected.
+function updateAlgorithmUI() {
+  const functional = state.algorithm === "functional";
+  $("nu-field").hidden = !functional;
+  const dr = $("diag-removal");
+  dr.disabled = functional;
+  const row = dr.closest(".check");
+  if (row) row.style.opacity = functional ? "0.45" : "";
+}
 
 function updateSourceVisibility() {
   document.querySelectorAll("[data-when]").forEach((el) => {
@@ -366,6 +422,7 @@ function updateSourceVisibility() {
   });
 }
 updateSourceVisibility();
+updateAlgorithmUI();
 
 // CSV file load
 $("csv-btn").addEventListener("click", () => $("csv-input").click());
@@ -405,6 +462,12 @@ function buildArrayDescriptor() {
       return { kind: "cross", n: state.crossN, length: state.crossLength, center, plane };
     case "csv":
       return { kind: "csv", text: state.csvText || "" };
+    case "manual":
+      return {
+        kind: "manual",
+        pos: (state.manualPos || []).map((p) => p.slice()),
+        weights: state.manualWeights ? state.manualWeights.slice() : null,
+      };
     case "sunflower":
     default:
       return { kind: "sunflower", n: state.n, diameter: state.diameter, center, plane };
@@ -431,10 +494,24 @@ function buildRequest(planeName) {
     focus,
     sources: activeSources(),
     frequency: state.frequency,
+    physics: buildPhysics(),
+  };
+}
+
+// The physics block every engine request carries (mirrors `Physics` in the Rust
+// bridge). Sent as a nested object rather than flattened.
+function buildPhysics() {
+  return {
     speed_of_sound: state.c,
     shading: state.shading,
     steering: state.steering,
     diag_removal: state.diagRemoval,
+    // σ² per sensor; 0 disables the noise floor entirely.
+    noise_power: state.noiseEnabled ? Math.pow(10, state.noiseDb / 10) : 0,
+    algorithm:
+      state.algorithm === "functional"
+        ? { kind: "functional", nu: state.nu }
+        : { kind: "conventional" },
   };
 }
 
@@ -460,9 +537,21 @@ async function computePlane(planeName) {
   }
 }
 
-async function compute() {
+// Sources that need something loaded/edited before they can resolve to an array.
+function arrayNotReady() {
   if (state.source === "csv" && !state.csvText) {
-    toast("Load a CSV of microphone positions first.");
+    return "Load a CSV of microphone positions first.";
+  }
+  if (state.source === "manual" && !(state.manualPos && state.manualPos.length)) {
+    return "No hand-edited layout yet — open the microphone editor first.";
+  }
+  return null;
+}
+
+async function compute() {
+  const blocked = arrayNotReady();
+  if (blocked) {
+    toast(blocked);
     return;
   }
 
@@ -509,8 +598,17 @@ function sourcesInPlane(plane) {
 }
 
 function drawPlot(res) {
+  // Show the band-averaged map instead of the single-frequency one when asked —
+  // but only while it still matches the current grid (the user may have resized
+  // the focus plane since the sweep ran).
+  const band =
+    state.showBand && lastSweep && lastSweep.band_values &&
+    lastSweep.nx === res.nx && lastSweep.ny === res.ny
+      ? lastSweep.band_values
+      : null;
+
   plot.render({
-    values: res.values,
+    values: band || res.values,
     nx: res.nx,
     ny: res.ny,
     u: res.u,
@@ -524,7 +622,8 @@ function drawPlot(res) {
     colormap: state.colormap,
     sources: sourcesInPlane(state.fplane),
   });
-  $("psf-plane").textContent = " · " + state.fplane;
+  $("psf-plane").textContent = " · " + state.fplane + (band ? " · band average" : "");
+  renderCut();
 }
 
 // Render a PSF result into an offscreen canvas and push the texture to geo
@@ -582,7 +681,8 @@ function exportCsv() {
   const lines = [];
   lines.push(`# PSF Array Viewer export`);
   lines.push(`# plane=${state.fplane} frequency_Hz=${state.frequency} speed_of_sound_m_s=${state.c}`);
-  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval}`);
+  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval} noise_dB=${state.noiseEnabled ? state.noiseDb : "off"}`);
+  lines.push(`# algorithm=${state.algorithm}${state.algorithm === "functional" ? ` nu=${state.nu}` : ""}`);
   lines.push(`# source_m=[${state.srcPos.join(",")}] grid=${res.nx}x${res.ny}`);
   lines.push(`${au}_m,${av}_m,level_dB`);
   for (let j = 0; j < res.ny; j++) {
@@ -602,6 +702,409 @@ function planeAxesLabels(label) {
 
 $("export-png").addEventListener("click", exportPng);
 $("export-csv").addEventListener("click", exportCsv);
+
+// ───────────────────────── microphone editor ─────────────────────────
+// Seeded from whatever array is currently resolved. Applying an edit converts the
+// array into a `manual` layout — a generator would otherwise overwrite the edit on
+// the next recompute.
+let micEditor = null;
+
+function openMicEditor() {
+  const res = lastResults[state.fplane];
+  if (!res || !res.mics || !res.mics.length) {
+    toast("Nothing to edit yet.");
+    return;
+  }
+  $("mic-overlay").hidden = false;
+  if (!micEditor) {
+    micEditor = new MicEditor($("mic-canvas"));
+    micEditor.onChange = updateMicSub;
+  }
+  // Editing happens in the array's own plane (out-of-plane offsets are preserved).
+  micEditor.load(res.mics.map((p) => p.slice()), state.aplane);
+  applyMicSnap();
+  updateMicSub();
+  micEditor.canvas.focus();
+}
+
+function updateMicSub() {
+  if (!micEditor) return;
+  const sel = micEditor.selectedCount();
+  $("mic-sub").textContent =
+    ` · ${micEditor.count()} mics` + (sel ? ` · ${sel} selected` : "") + ` · ${state.aplane} plane`;
+}
+
+function applyMicSnap() {
+  if (!micEditor) return;
+  const on = $("mic-snap-on").checked;
+  const step = parseFloat($("mic-snap").value);
+  micEditor.setSnap(on && step > 0 ? step : 0);
+  micEditor.draw();
+}
+
+function closeMicEditor() {
+  $("mic-overlay").hidden = true;
+}
+
+$("mic-edit").addEventListener("click", openMicEditor);
+$("mic-close").addEventListener("click", closeMicEditor);
+$("mic-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "mic-overlay") closeMicEditor();
+});
+$("mic-snap-on").addEventListener("change", applyMicSnap);
+$("mic-snap").addEventListener("input", applyMicSnap);
+
+// Reset re-seeds from the live array, discarding edits made in the dialog.
+$("mic-reset").addEventListener("click", () => {
+  const res = lastResults[state.fplane];
+  if (!res) return;
+  micEditor.load(res.mics.map((p) => p.slice()), state.aplane);
+  applyMicSnap();
+  updateMicSub();
+});
+
+$("mic-apply").addEventListener("click", () => {
+  if (!micEditor || !micEditor.count()) return;
+  const before = lastResults[state.fplane];
+  state.manualPos = micEditor.positions();
+  // Keep per-mic weights only if the count still lines up (mics may be deleted);
+  // otherwise fall back to the shading window.
+  const w = before && before.weights;
+  state.manualWeights =
+    w && w.length === state.manualPos.length ? w.slice() : null;
+
+  state.source = "manual";
+  setSeg("source", "manual");
+  updateSourceVisibility();
+  $("manual-status").textContent = `Hand-edited layout · ${state.manualPos.length} microphones.`;
+  closeMicEditor();
+  schedule();
+});
+
+// ───────────────────────── STL model + surface PSF ─────────────────────────
+// The model is parsed client-side (three.js STLLoader). Painting the PSF onto it
+// beamforms the mesh's surface samples through the same engine core the map uses
+// (compute_on_points / beamformPointsJS), so map and model always agree.
+const SURFACE_BUDGET = 4000;
+let stlBuffer = null;   // kept so a units-scale change can re-parse
+let stlSample = null;   // { points, stride, total } from the last load
+
+function showStlControls(on) {
+  document.querySelectorAll("[data-when-stl]").forEach((el) => (el.hidden = !on));
+  $("stl-run").hidden = !(on && state.stlPsf);
+}
+
+function loadStlBuffer(buffer, scale) {
+  const count = geo.loadSTL(buffer, scale);
+  stlSample = geo.surfacePoints(SURFACE_BUDGET);
+  $("stl-status").textContent =
+    `${state.stlName || "model"} · ${count.toLocaleString()} vertices · ${stlSample.points.length.toLocaleString()} samples`;
+  showStlControls(true);
+  if (state.stlPsf) runSurfacePsf();
+}
+
+async function runSurfacePsf() {
+  if (!stlSample || !state.stlPsf) return;
+  const btn = $("stl-run");
+  btn.disabled = true;
+  btn.textContent = "Evaluating…";
+  try {
+    const req = {
+      array: buildArrayDescriptor(),
+      sources: activeSources(),
+      points: stlSample.points,
+      frequency: state.frequency,
+      physics: buildPhysics(),
+    };
+    const inv = await getInvoke();
+    const res = inv ? await inv("compute_on_points", { req }) : jsComputeOnPoints(req);
+    geo.setSurfaceLevels(res.values, stlSample.stride, state.dyn, state.colormap);
+  } catch (e) {
+    toast(typeof e === "string" ? e : e.message || "Surface evaluation failed.");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Evaluate surface";
+  }
+}
+
+$("stl-btn").addEventListener("click", () => $("stl-input").click());
+$("stl-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      stlBuffer = reader.result;
+      state.stlName = file.name;
+      loadStlBuffer(stlBuffer, state.stlScale);
+    } catch {
+      toast("Could not parse that STL.");
+    }
+  };
+  reader.onerror = () => toast("Could not read that file.");
+  reader.readAsArrayBuffer(file);
+  e.target.value = "";
+});
+
+$("stl-clear").addEventListener("click", () => {
+  geo.clearSTL();
+  stlBuffer = null;
+  stlSample = null;
+  state.stlName = null;
+  state.stlPsf = false;
+  $("stl-psf").checked = false;
+  $("stl-status").textContent = "Optional. The PSF can be painted onto the model's surface.";
+  showStlControls(false);
+});
+
+$("stl-scale").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (!(v > 0) || !stlBuffer) return;
+  state.stlScale = v;
+  loadStlBuffer(stlBuffer, v);   // re-parse: geometry.scale() is not reversible
+});
+
+$("stl-psf").addEventListener("change", (e) => {
+  state.stlPsf = e.target.checked;
+  $("stl-run").hidden = !state.stlPsf;
+  if (state.stlPsf) runSurfacePsf();
+  else geo.clearSurfaceLevels();
+});
+
+$("stl-run").addEventListener("click", runSurfacePsf);
+
+// ───────────────────────── frequency sweep ─────────────────────────
+// A sweep is far too costly to run on every slider nudge, so it is explicit:
+// the user presses "Run sweep". Results feed two charts and, optionally, a
+// band-averaged map drawn in place of the single-frequency one.
+let chartBw = null;
+let chartPsl = null;
+
+function buildSweepRequest() {
+  // The base request carries the whole scene; `frequency` is simply swept over
+  // (the Rust SweepRequest ignores it; the JS engine overrides it per step).
+  return {
+    ...buildRequest(state.fplane),
+    f_min: state.sweepFmin,
+    f_max: state.sweepFmax,
+    n_points: Math.round(state.sweepPoints),
+    log_spacing: state.sweepLog,
+    band_map: state.sweepBand,
+  };
+}
+
+async function runSweep() {
+  const blocked = arrayNotReady();
+  if (blocked) {
+    toast(blocked);
+    return;
+  }
+  const btn = $("sweep-run");
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  try {
+    const req = buildSweepRequest();
+    const inv = await getInvoke();
+    lastSweep = inv ? await inv("compute_sweep", { req }) : jsComputeSweep(req);
+
+    $("sweep-open").disabled = false;
+    const hasBand = !!lastSweep.band_values;
+    $("show-band-row").hidden = !hasBand;
+    if (!hasBand && state.showBand) {
+      state.showBand = false;
+      $("show-band").checked = false;
+    }
+    openSweep();
+    // Repaint the map so a band average (if enabled) takes effect immediately.
+    const r = lastResults[state.fplane];
+    if (r) drawPlot(r);
+  } catch (e) {
+    toast(typeof e === "string" ? e : e.message || "Sweep failed.");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Run sweep";
+  }
+}
+
+function openSweep() {
+  if (!lastSweep) return;
+  $("sweep-overlay").hidden = false;
+  // Built lazily: the hosts have no size until the overlay is shown.
+  if (!chartBw) chartBw = new LineChart($("chart-bw"));
+  if (!chartPsl) chartPsl = new LineChart($("chart-psl"));
+  renderSweepCharts();
+}
+function closeSweep() {
+  $("sweep-overlay").hidden = true;
+}
+
+function renderSweepCharts() {
+  if (!lastSweep || !chartBw || !chartPsl) return;
+  const pts = lastSweep.points;
+  // A metric can be undefined at a given frequency (e.g. the −3 dB crossing
+  // falls outside the grid). NaN leaves a gap in the line rather than a spike.
+  const at = (p, key, scale = 1) => [p.frequency, p[key] == null ? NaN : p[key] * scale];
+
+  const markers = lastSweep.alias_frequency
+    ? [{ x: lastSweep.alias_frequency, label: "alias" }]
+    : [];
+  const fFmt = (v) => (v >= 1000 ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k` : `${v.toFixed(0)}`);
+
+  chartBw.render({
+    series: [
+      { label: "u", color: CHART_PALETTE[0], points: pts.map((p) => at(p, "beamwidth_u", 1000)) },
+      { label: "v", color: CHART_PALETTE[1], points: pts.map((p) => at(p, "beamwidth_v", 1000)) },
+    ],
+    xLabel: "frequency (Hz)",
+    yLabel: "width (mm)",
+    xLog: state.sweepLog,
+    markers,
+    xFormat: fFmt,
+    yFormat: (v) => v.toFixed(0),
+  });
+
+  chartPsl.render({
+    series: [
+      { label: "PSL", color: CHART_PALETTE[2], points: pts.map((p) => at(p, "peak_sidelobe_db")) },
+    ],
+    xLabel: "frequency (Hz)",
+    yLabel: "level (dB)",
+    xLog: state.sweepLog,
+    markers,
+    xFormat: fFmt,
+    yFormat: (v) => v.toFixed(1),
+  });
+
+  const f0 = pts[0].frequency;
+  const f1 = pts[pts.length - 1].frequency;
+  $("sweep-sub").textContent = ` · ${pts.length} points · ${fmtFreq(f0)} – ${fmtFreq(f1)}`;
+}
+
+function exportSweepCsv() {
+  if (!lastSweep) {
+    toast("Run a sweep first.");
+    return;
+  }
+  const lines = [];
+  lines.push("# PSF Array Viewer — frequency sweep");
+  lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval} noise_dB=${state.noiseEnabled ? state.noiseDb : "off"}`);
+  lines.push(`# mics=${lastSweep.n_mics} aperture_m=${lastSweep.aperture} alias_Hz=${lastSweep.alias_frequency ?? ""}`);
+  lines.push("frequency_Hz,beamwidth_u_m,beamwidth_v_m,peak_sidelobe_dB");
+  for (const p of lastSweep.points) {
+    lines.push([
+      p.frequency,
+      p.beamwidth_u ?? "",
+      p.beamwidth_v ?? "",
+      p.peak_sidelobe_db ?? "",
+    ].join(","));
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  downloadBlob(blob, `psf-sweep-${timestamp()}.csv`);
+}
+
+// Sweep parameters do not affect the live map, so they must not trigger compute.
+function bindSweepNumber(id, setter) {
+  const el = $(id);
+  el.addEventListener("input", () => setter(parseFloat(el.value)));
+}
+bindSweepNumber("sweep-fmin", (v) => { if (v > 0) state.sweepFmin = v; });
+bindSweepNumber("sweep-fmax", (v) => { if (v > 0) state.sweepFmax = v; });
+bindSweepNumber("sweep-points", (v) => {
+  if (v >= 2) state.sweepPoints = Math.min(MAX_SWEEP_POINTS, Math.round(v));
+});
+$("sweep-log").addEventListener("change", (e) => {
+  state.sweepLog = e.target.checked;
+  if (lastSweep) renderSweepCharts();
+});
+$("sweep-band").addEventListener("change", (e) => { state.sweepBand = e.target.checked; });
+$("show-band").addEventListener("change", (e) => {
+  state.showBand = e.target.checked;
+  const r = lastResults[state.fplane];
+  if (r) drawPlot(r);
+});
+$("sweep-run").addEventListener("click", runSweep);
+$("sweep-open").addEventListener("click", openSweep);
+$("sweep-close").addEventListener("click", closeSweep);
+$("sweep-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "sweep-overlay") closeSweep();
+});
+$("sweep-csv").addEventListener("click", exportSweepCsv);
+
+// ───────────────────────── 1-D line cut ─────────────────────────
+// Optional (off by default, zero layout cost when off). Cuts run through the
+// map's peak along u and v. Pinned cuts stay on the chart as dashed overlays so
+// the user can compare frequencies, shadings or algorithms against each other.
+let chartCut = null;
+let pinnedCuts = []; // in-memory only — derived data, never persisted
+
+function cutLabel() {
+  const alg = state.algorithm === "functional" ? `func ν${state.nu}` : "conv";
+  return `${fmtFreq(state.frequency)} · ${state.shading} · ${alg}`;
+}
+
+function currentCuts() {
+  const res = lastResults[state.fplane];
+  if (!res || !state.cut) return null;
+  const pk = plot.peakUV();
+  if (!pk) return null;
+  const uMin = res.u[0], uMax = res.u[res.nx - 1];
+  const vMin = res.v[0], vMax = res.v[res.ny - 1];
+  // Clamp to the display's dynamic range: raw nulls run to −300 dB and would
+  // otherwise collapse the chart's y scale.
+  const clamp = (pts) => pts.map(([s, db]) => [s, isFinite(db) ? Math.max(-state.dyn, db) : NaN]);
+  return {
+    u: clamp(plot.sampleLine(uMin, pk.v, uMax, pk.v)),
+    v: clamp(plot.sampleLine(pk.u, vMin, pk.u, vMax)),
+  };
+}
+
+function renderCut() {
+  if (!state.cut) return;
+  if (!chartCut) chartCut = new LineChart($("chart-cut"));
+  const cur = currentCuts();
+  if (!cur) return;
+
+  const series = [];
+  pinnedCuts.forEach((pin, i) => {
+    const c = CHART_PALETTE[(i + 2) % CHART_PALETTE.length];
+    series.push({ label: `${pin.label} u`, color: c, points: pin.u, dashed: true });
+    series.push({ label: `${pin.label} v`, color: c, points: pin.v, dashed: true });
+  });
+  series.push({ label: "u", color: CHART_PALETTE[0], points: cur.u });
+  series.push({ label: "v", color: CHART_PALETTE[1], points: cur.v });
+
+  chartCut.render({
+    series,
+    xLabel: "position through peak (m)",
+    yLabel: "level (dB)",
+    xLog: false,
+    hLines: [{ y: -3, label: "−3 dB" }],
+    xFormat: (v) => v.toFixed(2),
+    yFormat: (v) => v.toFixed(0),
+  });
+}
+
+function setCutEnabled(on) {
+  state.cut = on;
+  document.querySelector(".stage-psf").classList.toggle("with-cut", on);
+  if (on) renderCut();
+}
+
+$("cut").addEventListener("change", (e) => setCutEnabled(e.target.checked));
+$("cut-pin").addEventListener("click", () => {
+  const cur = currentCuts();
+  if (!cur) {
+    toast("Nothing to pin yet.");
+    return;
+  }
+  if (pinnedCuts.length >= 3) pinnedCuts.shift(); // keep the chart readable
+  pinnedCuts.push({ label: cutLabel(), u: cur.u, v: cur.v });
+  renderCut();
+});
+$("cut-clear").addEventListener("click", () => {
+  pinnedCuts = [];
+  renderCut();
+});
 
 // ───────────────────────── cursor readout ─────────────────────────
 (function bindReadout() {
@@ -642,7 +1145,7 @@ function syncAllControls() {
   const sliderMap = {
     n: "n", diameter: "diameter", "ring-n": "ringN", "ring-diameter": "ringDiameter",
     "grid-pitch": "gridPitch", "cross-n": "crossN", "cross-length": "crossLength",
-    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels",
+    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels", noise: "noiseDb", nu: "nu",
   };
   for (const id in sliderMap) {
     const setter = sliderSetters[id];
@@ -666,8 +1169,10 @@ function syncAllControls() {
   setSeg("fplane", state.fplane);
   setSeg("shading", state.shading);
   setSeg("steering", state.steering);
+  setSeg("algorithm", state.algorithm);
   setSeg("colormap", state.colormap);
   $("lab-steering").textContent = `Formulation ${state.steering}`;
+  updateAlgorithmUI();
 
   $("src-at-focus").checked = state.srcAtFocus;
   $("src-pos-fields").style.opacity = state.srcAtFocus ? "0.45" : "1";
@@ -675,9 +1180,34 @@ function syncAllControls() {
   $("multiplane").checked = state.multiplane;
   $("raytrace").checked = state.raytrace;
   $("rt-badge").hidden = !state.raytrace;
+
+  // The STL geometry itself is never persisted (only the units scale), so a
+  // restored session always starts without a model loaded.
+  state.stlName = null;
+  state.stlPsf = false;
+  $("stl-psf").checked = false;
+  $("stl-scale").value = state.stlScale;
+  showStlControls(false);
   $("diag-removal").checked = state.diagRemoval;
+  $("noise-enable").checked = state.noiseEnabled;
+  $("noise-field").hidden = !state.noiseEnabled;
   $("lines").checked = state.lines;
+  $("cut").checked = state.cut;
+  setCutEnabled(state.cut);
+
+  $("sweep-fmin").value = state.sweepFmin;
+  $("sweep-fmax").value = state.sweepFmax;
+  $("sweep-points").value = state.sweepPoints;
+  $("sweep-log").checked = state.sweepLog;
+  $("sweep-band").checked = state.sweepBand;
+  // A restored session has no sweep result yet, so the band controls stay off.
+  state.showBand = false;
+  $("show-band").checked = false;
+  $("show-band-row").hidden = true;
   if (state.csvName) $("csv-status").textContent = `Loaded ${state.csvName}`;
+  if (state.manualPos && state.manualPos.length) {
+    $("manual-status").textContent = `Hand-edited layout · ${state.manualPos.length} microphones.`;
+  }
 
   updateSourceVisibility();
   renderExtraSources();
@@ -701,6 +1231,8 @@ function applyConfig(cfg, silent = false) {
   state.extraSources = Array.isArray(s.extraSources)
     ? s.extraSources.map((x) => ({ pos: (x.pos || [0, 0, 0]).slice(), amplitude: x.amplitude ?? 1 }))
     : [];
+  state.manualPos = Array.isArray(s.manualPos) ? s.manualPos.map((p) => p.slice()) : null;
+  state.manualWeights = Array.isArray(s.manualWeights) ? s.manualWeights.slice() : null;
   syncAllControls();
   compute();
   if (!silent) toast("Configuration loaded.");
@@ -733,6 +1265,223 @@ $("config-input").addEventListener("change", (e) => {
   reader.onerror = () => toast("Could not read that file.");
   reader.readAsText(file);
   e.target.value = ""; // allow re-loading the same file
+});
+
+// ───────────────────────── A/B comparison + PDF report ─────────────────────────
+// A snapshot captures what is *already* on screen — the state, the metrics, the
+// rendered map, and the line cuts — so switching designs needs no recompute.
+const snapshots = { A: null, B: null };
+let chartAb = null;
+
+function takeSnapshot(slot) {
+  const res = lastResults[state.fplane];
+  if (!res) {
+    toast("Nothing to capture yet.");
+    return;
+  }
+  snapshots[slot] = {
+    slot,
+    time: new Date().toLocaleString(),
+    state: JSON.parse(JSON.stringify(state)),
+    metrics: res.metrics,
+    // The plot canvas already carries axes and the colorbar, so it stands alone.
+    png: plot.canvas.toDataURL("image/png"),
+    cuts: currentCuts(),
+  };
+  updateSnapStatus();
+}
+
+function updateSnapStatus() {
+  const tag = (s) => (snapshots[s] ? describeDesign(snapshots[s].state) : "empty");
+  $("snap-status").textContent = `A: ${tag("A")}   ·   B: ${tag("B")}`;
+  $("compare-open").disabled = !(snapshots.A && snapshots.B);
+}
+
+// A one-line human description of a design, used for slot labels and captions.
+function describeDesign(s) {
+  const arr =
+    s.source === "sunflower" ? `sunflower ${s.n}·${s.diameter}m`
+    : s.source === "ring" ? `ring ${s.ringN}·${s.ringDiameter}m`
+    : s.source === "grid" ? `grid ${s.gridNx}×${s.gridNy}·${s.gridPitch}m`
+    : s.source === "cross" ? `cross ${s.crossN}·${s.crossLength}m`
+    : s.source === "manual" ? `manual ${(s.manualPos || []).length} mics`
+    : `csv ${s.csvName || ""}`;
+  const alg = s.algorithm === "functional" ? `functional ν${s.nu}` : "conventional";
+  return `${arr} · ${fmtFreq(s.frequency)} · ${alg}`;
+}
+
+// Rows for the metrics table. `fmt` renders a value; `delta` renders B − A.
+const METRIC_ROWS = [
+  { key: "n_mics", label: "Microphones", fmt: (v) => (v == null ? "—" : `${v}`), diff: (a, b) => `${b - a > 0 ? "+" : ""}${b - a}` },
+  { key: "aperture", label: "Aperture", fmt: (v) => (v == null ? "—" : fmtLen(v)), diff: (a, b) => fmtLen(b - a) },
+  { key: "beamwidth_u", label: "−3 dB beam (u)", fmt: (v) => (v == null ? "—" : `${(v * 1000).toFixed(0)} mm`), diff: (a, b) => `${((b - a) * 1000).toFixed(0)} mm` },
+  { key: "beamwidth_v", label: "−3 dB beam (v)", fmt: (v) => (v == null ? "—" : `${(v * 1000).toFixed(0)} mm`), diff: (a, b) => `${((b - a) * 1000).toFixed(0)} mm` },
+  { key: "peak_sidelobe_db", label: "Peak side lobe", fmt: (v) => (v == null ? "—" : `${v.toFixed(1)} dB`), diff: (a, b) => `${(b - a).toFixed(1)} dB` },
+  { key: "alias_frequency", label: "Alias frequency", fmt: (v) => (v == null ? "—" : fmtFreq(v)), diff: (a, b) => fmtFreq(b - a) },
+];
+
+function metricsTableHtml(a, b) {
+  const head = b
+    ? "<thead><tr><th>Metric</th><th>A</th><th>B</th><th>Δ (B−A)</th></tr></thead>"
+    : "<thead><tr><th>Metric</th><th>Value</th></tr></thead>";
+  const rows = METRIC_ROWS.map((r) => {
+    const va = a.metrics[r.key];
+    if (!b) return `<tr><td>${r.label}</td><td>${r.fmt(va)}</td></tr>`;
+    const vb = b.metrics[r.key];
+    const d = va != null && vb != null ? r.diff(va, vb) : "—";
+    return `<tr><td>${r.label}</td><td>${r.fmt(va)}</td><td>${r.fmt(vb)}</td><td class="delta">${d}</td></tr>`;
+  }).join("");
+  return `${head}<tbody>${rows}</tbody>`;
+}
+
+function openCompare() {
+  const { A, B } = snapshots;
+  if (!A || !B) return;
+  $("compare-overlay").hidden = false;
+
+  $("ab-img-a").src = A.png;
+  $("ab-img-b").src = B.png;
+  $("ab-cap-a").textContent = `A — ${describeDesign(A.state)}`;
+  $("ab-cap-b").textContent = `B — ${describeDesign(B.state)}`;
+  $("ab-table").innerHTML = metricsTableHtml(A, B);
+
+  // Overlay the two designs' cuts, if both snapshots captured them.
+  const both = A.cuts && B.cuts;
+  $("chart-ab").hidden = !both;
+  $("ab-cut-title").hidden = !both;
+  if (both) {
+    if (!chartAb) chartAb = new LineChart($("chart-ab"));
+    chartAb.render({
+      series: [
+        { label: "A u", color: CHART_PALETTE[0], points: A.cuts.u },
+        { label: "A v", color: CHART_PALETTE[0], points: A.cuts.v, dashed: true },
+        { label: "B u", color: CHART_PALETTE[2], points: B.cuts.u },
+        { label: "B v", color: CHART_PALETTE[2], points: B.cuts.v, dashed: true },
+      ],
+      xLabel: "position through peak (m)",
+      yLabel: "level (dB)",
+      xLog: false,
+      hLines: [{ y: -3, label: "−3 dB" }],
+      xFormat: (v) => v.toFixed(2),
+      yFormat: (v) => v.toFixed(0),
+    });
+  }
+}
+function closeCompare() {
+  $("compare-overlay").hidden = true;
+}
+
+// ── printable report ──
+// Built as a plain DOM subtree that only @media print reveals, then handed to the
+// browser's print dialog — which every platform can render straight to PDF. No PDF
+// library is bundled; this project keeps its payload small on purpose.
+function configRowsHtml(s) {
+  const rows = [
+    ["Array", describeDesign(s)],
+    ["Array plane / centre", `${s.aplane} · [${s.acenter.join(", ")}] m`],
+    ["Focus plane / centre", `${s.fplane} · [${s.fcenter.join(", ")}] m`],
+    ["Focus size / step", `${s.width} × ${s.height} m · dx ${s.dx} m`],
+    ["Frequency", fmtFreq(s.frequency)],
+    ["Speed of sound", `${s.c} m/s`],
+    ["Shading", s.shading],
+    ["Steering", `Formulation ${s.steering}`],
+    ["Algorithm", s.algorithm === "functional" ? `Functional (ν = ${s.nu})` : "Conventional"],
+    ["Diagonal removal", s.algorithm === "functional" ? "n/a" : s.diagRemoval ? "on" : "off"],
+    ["Sensor noise", s.noiseEnabled ? `${s.noiseDb} dB` : "off"],
+    ["Sources", `${1 + (s.extraSources || []).length}`],
+    ["Dynamic range", `${s.dyn} dB`],
+  ];
+  return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+}
+
+function designSectionHtml(snap, title) {
+  return `
+    <section>
+      <h2>${title}</h2>
+      <table><tbody>${configRowsHtml(snap.state)}</tbody></table>
+    </section>`;
+}
+
+function buildReport() {
+  const { A, B } = snapshots;
+  // Compare A/B when both slots are filled; otherwise report the live design.
+  let designs = [];
+  if (A && B) designs = [A, B];
+  else if (A || B) designs = [A || B];
+  else {
+    const res = lastResults[state.fplane];
+    if (!res) {
+      toast("Nothing to report yet.");
+      return false;
+    }
+    designs = [{
+      slot: "—",
+      state: JSON.parse(JSON.stringify(state)),
+      metrics: res.metrics,
+      png: plot.canvas.toDataURL("image/png"),
+      cuts: currentCuts(),
+    }];
+  }
+
+  const maps = designs
+    .map((d) => `<figure><figcaption>${d.slot !== "—" ? d.slot + " — " : ""}${describeDesign(d.state)}</figcaption><img src="${d.png}" /></figure>`)
+    .join("");
+
+  const two = designs.length === 2;
+  const sweepHtml =
+    lastSweep && chartBw && chartPsl
+      ? `<section>
+           <h2>Frequency sweep</h2>
+           <div class="maps">
+             <figure><figcaption>−3 dB main-lobe width</figcaption><img src="${chartBw.canvas.toDataURL("image/png")}" /></figure>
+             <figure><figcaption>Peak side-lobe level</figcaption><img src="${chartPsl.canvas.toDataURL("image/png")}" /></figure>
+           </div>
+         </section>`
+      : "";
+
+  $("report").innerHTML = `
+    <h1>PSF Array Viewer — report</h1>
+    <div class="meta">Generated ${new Date().toLocaleString()}</div>
+
+    <section>
+      <h2>Point spread function</h2>
+      <div class="maps${two ? "" : " single"}">${maps}</div>
+    </section>
+
+    <section>
+      <h2>Metrics</h2>
+      <table>${metricsTableHtml(designs[0], two ? designs[1] : null)}</table>
+    </section>
+
+    ${designs.map((d) => designSectionHtml(d, two ? `Configuration ${d.slot}` : "Configuration")).join("")}
+    ${sweepHtml}
+  `;
+  return true;
+}
+
+function printReport() {
+  if (!buildReport()) return;
+  // Give the browser a tick to lay out the freshly-injected images.
+  setTimeout(() => window.print(), 60);
+}
+
+$("snap-a").addEventListener("click", () => takeSnapshot("A"));
+$("snap-b").addEventListener("click", () => takeSnapshot("B"));
+$("compare-open").addEventListener("click", openCompare);
+$("compare-close").addEventListener("click", closeCompare);
+$("compare-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "compare-overlay") closeCompare();
+});
+$("ab-clear").addEventListener("click", () => {
+  snapshots.A = null;
+  snapshots.B = null;
+  updateSnapStatus();
+  closeCompare();
+});
+$("report-btn").addEventListener("click", printReport);
+$("ab-report").addEventListener("click", () => {
+  closeCompare();
+  printReport();
 });
 
 // ───────────────────────── readouts ─────────────────────────
@@ -832,6 +1581,14 @@ function buildArrayJS(req) {
     }
     return { pos, weights: null };
   }
+  if (a.kind === "manual") {
+    const pos = (a.pos || []).map((p) => p.slice());
+    if (!pos.length) throw "Array needs at least one microphone.";
+    if (a.weights && a.weights.length !== pos.length) {
+      throw "Manual array: one weight per microphone is required.";
+    }
+    return { pos, weights: a.weights ? a.weights.slice() : null };
+  }
   const pos = [], w = [];
   let anyW = false;
   for (const raw of a.text.split(/\r?\n/)) {
@@ -882,110 +1639,313 @@ function gridJS(focus) {
   return { nx, ny, u, v, corners, uh, vh };
 }
 
+// ── small complex linear algebra (functional beamforming only) ──
+// Mirrors psf-core: used only on the S×S source Gram matrix, S = source count.
+const cadd = (a, b) => [a[0] + b[0], a[1] + b[1]];
+const cmul = (a, b) => [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]];
+const cconj = (a) => [a[0], -a[1]];
+
+// Jacobi eigendecomposition of a small complex Hermitian matrix (n×n, row-major).
+// Returns { lambda, v } with eigenvector i in COLUMN i of v. Mirrors
+// psf_core::hermitian_eig — see there for the rotation derivation.
+function hermitianEig(aIn, n) {
+  const a = aIn.map((c) => [c[0], c[1]]);
+  const v = Array.from({ length: n * n }, () => [0, 0]);
+  for (let i = 0; i < n; i++) v[i * n + i] = [1, 0];
+  if (n <= 1) return { lambda: Array.from({ length: n }, (_, i) => a[i * n + i][0]), v };
+
+  for (let sweep = 0; sweep < 60; sweep++) {
+    let off = 0;
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++)
+        if (i !== j) off += a[i * n + j][0] ** 2 + a[i * n + j][1] ** 2;
+    if (Math.sqrt(off) <= 1e-13) break;
+
+    for (let p = 0; p < n; p++) {
+      for (let q = p + 1; q < n; q++) {
+        const apq = a[p * n + q];
+        const r = Math.hypot(apq[0], apq[1]);
+        if (r <= 1e-18) continue;
+        const app = a[p * n + p][0];
+        const aqq = a[q * n + q][0];
+        const phi = Math.atan2(apq[1], apq[0]);
+        const theta = 0.5 * Math.atan2(2 * r, app - aqq);
+        const c = Math.cos(theta), s = Math.sin(theta);
+        const ePos = [Math.cos(phi), Math.sin(phi)];
+        const eNeg = [Math.cos(phi), -Math.sin(phi)];
+        const uPQ = cmul([-s, 0], ePos);
+        const uQP = cmul([s, 0], eNeg);
+
+        for (let i = 0; i < n; i++) {          // A ← A·U (columns p, q)
+          const aip = a[i * n + p], aiq = a[i * n + q];
+          a[i * n + p] = cadd(cmul(aip, [c, 0]), cmul(aiq, uQP));
+          a[i * n + q] = cadd(cmul(aip, uPQ), cmul(aiq, [c, 0]));
+        }
+        const uhPQ = cconj(uQP), uhQP = cconj(uPQ);
+        for (let j = 0; j < n; j++) {          // A ← Uᴴ·A (rows p, q)
+          const apj = a[p * n + j], aqj = a[q * n + j];
+          a[p * n + j] = cadd(cmul([c, 0], apj), cmul(uhPQ, aqj));
+          a[q * n + j] = cadd(cmul(uhQP, apj), cmul([c, 0], aqj));
+        }
+        for (let i = 0; i < n; i++) {          // V ← V·U (columns p, q)
+          const vip = v[i * n + p], viq = v[i * n + q];
+          v[i * n + p] = cadd(cmul(vip, [c, 0]), cmul(viq, uQP));
+          v[i * n + q] = cadd(cmul(vip, uPQ), cmul(viq, [c, 0]));
+        }
+      }
+    }
+  }
+  return { lambda: Array.from({ length: n }, (_, i) => a[i * n + i][0]), v };
+}
+
 // Sarradj (2012) steering-vector formulations — mirrors psf-core/src/lib.rs.
 // x_m(t) = (r0/rm) * exp(-jk(rm - r0)); reference r0 is the array centroid.
 //   I   (classic):       h_m = x_m / |x_m|                (phase only)
 //   II  (inverse):       h_m = 1 / conj(x_m)
 //   III (true level):    h_m = x_m / Σ w_m|x_m|²
 //   IV  (true location): h_m = x_m / sqrt(Σw_m * Σ w_m|x_m|²)
-function jsCompute(req) {
-  const arr       = buildArrayJS(req);
-  const weights   = weightsForJS(arr, req.shading);
-  const f         = req.focus;
-  const g         = gridJS(f);
-  const k         = (2 * Math.PI * req.frequency) / req.speed_of_sound;
+// Beamform an arbitrary point cloud → raw (un-normalised) linear power.
+// This is the JS mirror of psf_core::compute_at_points (roadmap R1/R2): the grid
+// map and the STL surface map both run through it, so the two engines and the two
+// scan geometries can never drift apart.
+function beamformPointsJS(arr, weights, points, sources, phys, frequency) {
+  const k         = (2 * Math.PI * frequency) / phys.speed_of_sound;
   const reference = centroid(arr.pos);
-  const formulation = req.steering || "I";
-  const diagRemoval  = !!req.diag_removal;
-  const sources = (req.sources && req.sources.length)
-    ? req.sources
-    : [{ pos: req.source || f.center, amplitude: 1 }];
+  const formulation = phys.steering || "I";
+  const noise        = Math.max(0, phys.noise_power || 0);   // σ² per sensor
+  const algorithm    = phys.algorithm || { kind: "conventional" };
+  const isFunctional = algorithm.kind === "functional";
+  // Diagonal removal is conventional-only — functional reaches C through its
+  // low-rank eigenpairs, where there is no materialised diagonal to strip.
+  const diagRemoval  = !!phys.diag_removal && !isFunctional;
   const nsrc = sources.length;
 
-  // Free-field pressure at each mic from each source (p[mi][s]) and the CSM
-  // diagonal Cmm[mi] = Σ_s |p_{s,mi}|².
-  const p = [], cmm = [];
+  // Free-field complex pressure at each mic from each source (p[mi][s] = gₛ at
+  // mic mi). Only this propagation vector is needed — no cross-spectral matrix
+  // (or its diagonal) is ever formed.
+  const p = [];
   for (let mi = 0; mi < arr.pos.length; mi++) {
     const row = [];
-    let diag = 0;
     for (let s = 0; s < nsrc; s++) {
       const d = Math.max(1e-9, vdist(arr.pos[mi], sources[s].pos));
       const ph = -k * d;
       const a = sources[s].amplitude;
-      const pr = a * Math.cos(ph) / d, pi = a * Math.sin(ph) / d;
-      row.push([pr, pi]);
-      diag += pr * pr + pi * pi;
+      row.push([a * Math.cos(ph) / d, a * Math.sin(ph) / d]);
     }
     p.push(row);
-    cmm.push(diag);
   }
 
   const wsum = weights.reduce((a, b) => a + b, 0);
   const wsumSafe = Math.abs(wsum) < 1e-30 ? 1 : wsum;
   const needsNormPass = formulation === "III" || formulation === "IV";
-  const sRe = new Float64Array(nsrc), sIm = new Float64Array(nsrc);
+  const sRe = new Float64Array(nsrc), sIm = new Float64Array(nsrc), sDiag = new Float64Array(nsrc);
 
-  const raw = new Float64Array(g.nx * g.ny);
-  for (let j = 0; j < g.ny; j++) {
-    for (let i = 0; i < g.nx; i++) {
-      const pt = vadd(f.center, vadd(vscale(g.uh, g.u[i]), vscale(g.vh, g.v[j])));
-      const r0 = Math.max(1e-9, vdist(reference, pt));
-
-      let normSqSum = 1;
-      if (needsNormPass) {
-        let s = 0;
-        for (let mi = 0; mi < arr.pos.length; mi++) {
-          const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
-          const gm = r0 / rm;
-          s += weights[mi] * gm * gm;
-        }
-        normSqSum = Math.abs(s) < 1e-30 ? 1 : s;
+  // Functional beamforming: C = G·Gᴴ + σ²I is low-rank in the sources, so its
+  // eigenpairs come from the S×S Gram matrix M_st = gₛᴴ·g_t — never an N×N CSM.
+  //   hᴴC^{1/ν}h = σ^{2/ν}·‖h‖² + Σ_i [(λ_i+σ²)^{1/ν} − σ^{2/ν}]·|z_i|²/λ_i
+  // with z_i = Σ_s v_{s,i}·Sₛ, so it rides on the per-source projections Sₛ and
+  // ‖h‖² the scan loop already accumulates.
+  let ft = null;
+  if (isFunctional) {
+    const nu = isFinite(algorithm.nu) && algorithm.nu >= 1 ? algorithm.nu : 1;
+    const gram = Array.from({ length: nsrc * nsrc }, () => [0, 0]);
+    for (let s = 0; s < nsrc; s++) {
+      for (let t = 0; t < nsrc; t++) {
+        let acc = [0, 0];
+        for (let mi = 0; mi < p.length; mi++) acc = cadd(acc, cmul(cconj(p[mi][s]), p[mi][t]));
+        gram[s * nsrc + t] = acc;
       }
-      let norm;
-      if (formulation === "III") norm = normSqSum;
-      else if (formulation === "IV") norm = Math.sqrt(Math.max(0, wsumSafe) * normSqSum);
-      else norm = wsumSafe;
-      const invNorm = Math.abs(norm) < 1e-30 ? 1 : 1 / norm;
+    }
+    const { lambda, v } = hermitianEig(gram, nsrc);
+    const base = Math.pow(noise, 1 / nu);          // σ^{2/ν}  (noise is σ²)
+    const coef = lambda.map((l) =>
+      l <= 1e-30 ? 0 : (Math.pow(l + noise, 1 / nu) - base) / l
+    );
+    ft = { nu, base, coef, v, n: nsrc };
+  }
 
-      sRe.fill(0);
-      sIm.fill(0);
-      let diagSum = 0;
+  const raw = new Float64Array(points.length);
+  for (let idx = 0; idx < points.length; idx++) {
+    const pt = points[idx];
+    const r0 = Math.max(1e-9, vdist(reference, pt));
+
+    let normSqSum = 1;
+    if (needsNormPass) {
+      let s = 0;
       for (let mi = 0; mi < arr.pos.length; mi++) {
         const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
         const gm = r0 / rm;
-        const ph = -k * (rm - r0);
-        const c = Math.cos(ph), s = Math.sin(ph);
-        let yRe, yIm;
-        if (formulation === "II") { yRe = c / gm; yIm = s / gm; }
-        else if (formulation === "III" || formulation === "IV") { yRe = gm * c; yIm = gm * s; }
-        else { yRe = c; yIm = s; }
-        const hRe = weights[mi] * yRe * invNorm;
-        const hIm = weights[mi] * yIm * invNorm;
-        const prow = p[mi];
-        for (let s2 = 0; s2 < nsrc; s2++) {
-          const pRe = prow[s2][0], pIm = prow[s2][1];
-          sRe[s2] += hRe * pRe + hIm * pIm;
-          sIm[s2] += hRe * pIm - hIm * pRe;
-        }
-        if (diagRemoval) diagSum += (hRe * hRe + hIm * hIm) * cmm[mi];
+        s += weights[mi] * gm * gm;
       }
-      let power = 0;
-      for (let s2 = 0; s2 < nsrc; s2++) power += sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
-      if (diagRemoval) power -= diagSum;
-      raw[j * g.nx + i] = Math.max(0, power);
+      normSqSum = Math.abs(s) < 1e-30 ? 1 : s;
+    }
+    let norm;
+    if (formulation === "III") norm = normSqSum;
+    else if (formulation === "IV") norm = Math.sqrt(Math.max(0, wsumSafe) * normSqSum);
+    else norm = wsumSafe;
+    const invNorm = Math.abs(norm) < 1e-30 ? 1 : 1 / norm;
+
+    sRe.fill(0);
+    sIm.fill(0);
+    if (diagRemoval) sDiag.fill(0);
+    let hNorm2 = 0;   // Σ_m |h_m|² — array response to white sensor noise
+    for (let mi = 0; mi < arr.pos.length; mi++) {
+      const rm = Math.max(1e-9, vdist(arr.pos[mi], pt));
+      const gm = r0 / rm;
+      const ph = -k * (rm - r0);
+      const c = Math.cos(ph), s = Math.sin(ph);
+      let yRe, yIm;
+      if (formulation === "II") { yRe = c / gm; yIm = s / gm; }
+      else if (formulation === "III" || formulation === "IV") { yRe = gm * c; yIm = gm * s; }
+      else { yRe = c; yIm = s; }
+      const hRe = weights[mi] * yRe * invNorm;
+      const hIm = weights[mi] * yIm * invNorm;
+      const hMag2 = hRe * hRe + hIm * hIm;
+      hNorm2 += hMag2;
+      const prow = p[mi];
+      for (let s2 = 0; s2 < nsrc; s2++) {
+        const pRe = prow[s2][0], pIm = prow[s2][1];
+        sRe[s2] += hRe * pRe + hIm * pIm;
+        sIm[s2] += hRe * pIm - hIm * pRe;
+        if (diagRemoval) sDiag[s2] += hMag2 * (pRe * pRe + pIm * pIm);
+      }
+    }
+
+    let power;
+    if (ft) {
+      // Functional: P = (hᴴC^{1/ν}h)^ν, from the projections already in hand.
+      let acc = ft.base * hNorm2;
+      for (let i2 = 0; i2 < ft.n; i2++) {
+        let z = [0, 0];
+        for (let s2 = 0; s2 < ft.n; s2++) {
+          z = cadd(z, cmul(ft.v[s2 * ft.n + i2], [sRe[s2], sIm[s2]]));
+        }
+        acc += ft.coef[i2] * (z[0] * z[0] + z[1] * z[1]);
+      }
+      power = Math.pow(Math.max(0, acc), ft.nu);
+    } else {
+      // Conventional: incoherent sum of per-source powers, each with its own
+      // autopower (diagonal) term removed when requested — no CSM materialised.
+      power = 0;
+      for (let s2 = 0; s2 < nsrc; s2++) {
+        let ps = sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
+        if (diagRemoval) ps -= sDiag[s2];
+        power += ps;
+      }
+      // White sensor-noise floor σ²·Σ_m|h_m|² — added to the output, and
+      // stripped again by diagonal removal (which is why DR rejects it).
+      const noiseContrib = noise * hNorm2;
+      power += noiseContrib;
+      if (diagRemoval) power -= noiseContrib;
+    }
+    raw[idx] = Math.max(0, power);
+  }
+
+  return raw;
+}
+
+// Mirrors psf_core::normalize_to_db — peak-referenced dB, floored at −300.
+function normalizeToDbJS(raw) {
+  let p0 = 1e-30;
+  for (let i = 0; i < raw.length; i++) if (raw[i] > p0) p0 = raw[i];
+  const out = new Float32Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = Math.max(-300, 10 * Math.log10(raw[i] / p0 + 1e-30));
+  }
+  return out;
+}
+
+function jsCompute(req) {
+  const phys    = req.physics || {};
+  const arr     = buildArrayJS(req);
+  const weights = weightsForJS(arr, phys.shading);
+  const f       = req.focus;
+  const g       = gridJS(f);
+  const sources = (req.sources && req.sources.length)
+    ? req.sources
+    : [{ pos: f.center, amplitude: 1 }];
+
+  // Grid scan points, row-major (v outer, u inner).
+  const points = [];
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) {
+      points.push(vadd(f.center, vadd(vscale(g.uh, g.u[i]), vscale(g.vh, g.v[j]))));
     }
   }
 
-  // Normalise to the grid's own peak — the source (and thus the peak) need
-  // not sit at the grid's geometric centre.
-  const p0 = Math.max(1e-30, raw.reduce((a, b) => Math.max(a, b), 0));
-  const values = new Float32Array(g.nx * g.ny);
-  for (let idx = 0; idx < raw.length; idx++) {
-    values[idx] = Math.max(-300, 10 * Math.log10(raw[idx] / p0 + 1e-30));
+  const raw = beamformPointsJS(arr, weights, points, sources, phys, req.frequency);
+  const values = normalizeToDbJS(raw);
+  const metrics = metricsJS(arr, g, values, phys.speed_of_sound);
+  // `raw` (un-normalised linear power) rides along so a sweep can band-average in
+  // the power domain before normalising once.
+  return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, raw, metrics };
+}
+
+// Mirrors the compute_on_points Tauri command — beamform an explicit point cloud
+// (the surface samples of a loaded STL model).
+function jsComputeOnPoints(req) {
+  const phys    = req.physics || {};
+  const arr     = buildArrayJS(req);
+  const weights = weightsForJS(arr, phys.shading);
+  const raw = beamformPointsJS(arr, weights, req.points, req.sources, phys, req.frequency);
+  return { values: normalizeToDbJS(raw) };
+}
+
+// Mirrors psf_core::sweep_frequencies.
+function sweepFrequenciesJS(fMin, fMax, n, log) {
+  if (!(n >= 1)) throw "Sweep needs at least one frequency point.";
+  if (n > MAX_SWEEP_POINTS) throw `Sweep is limited to ${MAX_SWEEP_POINTS} frequency points.`;
+  if (!isFinite(fMin) || !isFinite(fMax) || fMin <= 0 || fMax <= 0) throw "Sweep frequencies must be positive.";
+  if (fMax < fMin) throw "Sweep f max must be at least f min.";
+  if (n === 1) return [fMin];
+  const nn = n - 1;
+  return Array.from({ length: n }, (_, i) => {
+    const t = i / nn;
+    return log ? fMin * Math.pow(fMax / fMin, t) : fMin + t * (fMax - fMin);
+  });
+}
+
+// Mirrors psf_core::compute_sweep — per-frequency metrics plus an optional
+// incoherent (power-domain) band average, normalised once at the end.
+function jsComputeSweep(req) {
+  const freqs = sweepFrequenciesJS(req.f_min, req.f_max, req.n_points, req.log_spacing);
+  const points = [];
+  let band = null;
+  let first = null;
+
+  for (const f of freqs) {
+    const r = jsCompute({ ...req, frequency: f });
+    if (!first) first = r;
+    if (req.band_map) {
+      if (!band) band = new Float64Array(r.raw.length);
+      for (let i = 0; i < band.length; i++) band[i] += r.raw[i];
+    }
+    points.push({
+      frequency: f,
+      beamwidth_u: r.metrics.beamwidth_u,
+      beamwidth_v: r.metrics.beamwidth_v,
+      peak_sidelobe_db: r.metrics.peak_sidelobe_db,
+    });
   }
 
-  const metrics = metricsJS(arr, g, values, req.speed_of_sound);
-  return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, metrics };
+  let band_values = null;
+  if (req.band_map && band) {
+    let p0 = 1e-30;
+    for (let i = 0; i < band.length; i++) if (band[i] > p0) p0 = band[i];
+    band_values = new Float32Array(band.length);
+    for (let i = 0; i < band.length; i++) {
+      band_values[i] = Math.max(-300, 10 * Math.log10(band[i] / p0 + 1e-30));
+    }
+  }
+
+  return {
+    points,
+    band_values,
+    nx: first.nx, ny: first.ny, u: first.u, v: first.v,
+    alias_frequency: first.metrics.alias_frequency,
+    aperture: first.metrics.aperture,
+    n_mics: first.metrics.n_mics,
+  };
 }
 
 function halfWidth(coords, line, center, fwd) {

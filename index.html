@@ -39,6 +39,7 @@
             <button data-val="grid">Grid</button>
             <button data-val="cross">Cross</button>
             <button data-val="csv">CSV</button>
+            <button data-val="manual">Manual</button>
           </div>
 
           <!-- Sunflower / Ring share microphone-count + diameter -->
@@ -132,6 +133,13 @@
             <input type="file" id="csv-input" accept=".csv,.txt,.tsv" hidden />
             <p class="hint" id="csv-status">3 columns x,y,z (metres). Optional 4th = weight.</p>
           </div>
+
+          <div data-when="source=manual" hidden>
+            <p class="hint" id="manual-status">Hand-edited layout.</p>
+          </div>
+
+          <button class="file-btn" id="mic-edit" style="margin-top:12px">Edit microphones…</button>
+          <p class="hint">Move individual microphones. Editing turns the array into a hand-edited layout.</p>
         </section>
 
         <section class="group">
@@ -197,6 +205,25 @@
             <input type="checkbox" id="raytrace" />
             <span>Path tracing<span class="hint" style="display:inline;margin:0 0 0 6px;font-size:9.5px">(progressive)</span></span>
           </label>
+
+          <div class="field" style="margin-top:14px">
+            <span>3-D model (STL)</span>
+            <button class="file-btn" id="stl-btn">Load STL…</button>
+            <input type="file" id="stl-input" accept=".stl" hidden />
+            <p class="hint" id="stl-status">Optional. The PSF can be painted onto the model's surface.</p>
+          </div>
+          <div data-when-stl hidden>
+            <div class="field grid2">
+              <label><span>Units → m</span><input type="number" id="stl-scale" value="1" min="0.0001" step="0.001" /></label>
+              <label><span>&nbsp;</span><button class="file-btn" id="stl-clear">Remove</button></label>
+            </div>
+            <label class="check">
+              <input type="checkbox" id="stl-psf" />
+              <span>Paint PSF on surface</span>
+            </label>
+            <button class="file-btn" id="stl-run" style="margin-top:10px" hidden>Evaluate surface</button>
+            <p class="hint">Evaluated at up to 4000 surface samples — press Evaluate after changing the setup.</p>
+          </div>
         </section>
 
         <section class="group">
@@ -222,6 +249,18 @@
             </div>
           </div>
           <div class="field">
+            <span>Algorithm</span>
+            <div class="seg sm" data-seg="algorithm">
+              <button data-val="conventional" class="on">Conventional</button>
+              <button data-val="functional">Functional</button>
+            </div>
+          </div>
+          <label class="field" id="nu-field" hidden>
+            <span>Exponent ν <em id="lab-nu">16</em></span>
+            <input type="range" id="nu" min="1" max="64" step="1" value="16" />
+            <p class="hint">Functional beamforming: P = (hᴴ·C<sup>1/ν</sup>·h)<sup>ν</sup>. Higher ν sharpens the lobe; ν = 1 is conventional.</p>
+          </label>
+          <div class="field">
             <span>Steering vector <em id="lab-steering">Formulation I</em></span>
             <div class="seg sm" data-seg="steering">
               <button data-val="I" class="on">I</button>
@@ -233,7 +272,16 @@
           </div>
           <label class="check">
             <input type="checkbox" id="diag-removal" />
-            <span>Diagonal removal (CSM)</span>
+            <span>Diagonal removal (autopower)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="noise-enable" />
+            <span>Sensor noise floor</span>
+          </label>
+          <label class="field" id="noise-field" hidden>
+            <span>Noise level <em id="lab-noise">−40 dB</em></span>
+            <input type="range" id="noise" min="-80" max="0" step="1" value="-40" />
+            <p class="hint">Per-sensor white noise, σ² = 10^(dB/10). Diagonal removal cancels it.</p>
           </label>
         </section>
 
@@ -262,6 +310,54 @@
             <input type="checkbox" id="lines" checked />
             <span>Contour lines</span>
           </label>
+          <label class="check">
+            <input type="checkbox" id="cut" />
+            <span>1-D line cut</span>
+          </label>
+          <p class="hint">Cuts through the peak along u and v. "Pin" keeps a cut on the chart so you can compare settings.</p>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">Analysis</div>
+          <div class="field grid2">
+            <label><span>f min (Hz)</span><input type="number" id="sweep-fmin" value="1000" min="1" step="100" /></label>
+            <label><span>f max (Hz)</span><input type="number" id="sweep-fmax" value="10000" min="1" step="100" /></label>
+          </div>
+          <div class="field grid2">
+            <label><span>Points</span><input type="number" id="sweep-points" value="24" min="2" max="200" step="1" /></label>
+            <label><span>&nbsp;</span>
+              <label class="check" style="margin:0">
+                <input type="checkbox" id="sweep-log" checked />
+                <span>Log spacing</span>
+              </label>
+            </label>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="sweep-band" checked />
+            <span>Band-averaged map</span>
+          </label>
+          <label class="check" id="show-band-row" hidden>
+            <input type="checkbox" id="show-band" />
+            <span>Show band average on map</span>
+          </label>
+          <div class="field grid2" style="margin-top:12px">
+            <button class="file-btn" id="sweep-run">Run sweep</button>
+            <button class="file-btn" id="sweep-open" disabled>Charts…</button>
+          </div>
+          <p class="hint">Sweeps the band and plots beamwidth and peak side-lobe vs frequency. Not live — press Run.</p>
+        </section>
+
+        <section class="group">
+          <div class="eyebrow">Compare</div>
+          <div class="field grid2">
+            <button class="file-btn" id="snap-a">Snapshot A</button>
+            <button class="file-btn" id="snap-b">Snapshot B</button>
+          </div>
+          <p class="hint" id="snap-status">Capture the current design into a slot, change the setup, then capture the other slot.</p>
+          <div class="field grid2">
+            <button class="file-btn" id="compare-open" disabled>Compare…</button>
+            <button class="file-btn" id="report-btn">Report (PDF)</button>
+          </div>
         </section>
 
         <section class="group">
@@ -289,6 +385,13 @@
         </div>
         <div id="plot" class="canvas-host"></div>
         <div class="cursor-readout" id="psf-readout" hidden></div>
+        <div class="cut-panel" id="cut-panel">
+          <div class="cut-tools">
+            <button class="tool-btn" id="cut-pin" title="Pin these cuts for comparison">Pin</button>
+            <button class="tool-btn" id="cut-clear" title="Clear pinned cuts">Clear</button>
+          </div>
+          <div class="chart-host" id="chart-cut"></div>
+        </div>
       </main>
 
       <!-- ───────────────────────── metrics ───────────────────────── -->
@@ -355,6 +458,78 @@
         <div class="modal-foot">
           <button class="file-btn" id="settings-reset">Reset to defaults</button>
           <button class="file-btn" id="settings-apply">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── A/B compare modal ───────────────────────── -->
+    <div class="modal-overlay" id="compare-overlay" hidden>
+      <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="compare-title">
+        <div class="modal-head">
+          <h2 id="compare-title">A / B comparison</h2>
+          <button class="modal-close" id="compare-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="ab-maps">
+            <figure><figcaption id="ab-cap-a">A</figcaption><img id="ab-img-a" alt="PSF map, design A" /></figure>
+            <figure><figcaption id="ab-cap-b">B</figcaption><img id="ab-img-b" alt="PSF map, design B" /></figure>
+          </div>
+          <table class="ab-table" id="ab-table"></table>
+          <div class="chart-title" id="ab-cut-title" hidden>Line cuts through the peak</div>
+          <div class="chart-host" id="chart-ab" hidden></div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="ab-clear">Clear slots</button>
+          <button class="file-btn" id="ab-report">Report (PDF)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── printable report ───────────────────────── -->
+    <div id="report" aria-hidden="true"></div>
+
+    <!-- ───────────────────────── mic editor modal ───────────────────────── -->
+    <div class="modal-overlay" id="mic-overlay" hidden>
+      <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="mic-title">
+        <div class="modal-head">
+          <h2 id="mic-title">Microphone editor<span class="dim" id="mic-sub"></span></h2>
+          <button class="modal-close" id="mic-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="mic-canvas" id="mic-canvas"></div>
+          <div class="mic-bar">
+            <label class="check" style="margin:0">
+              <input type="checkbox" id="mic-snap-on" />
+              <span>Snap to grid</span>
+            </label>
+            <label class="mic-step"><span>step (m)</span>
+              <input type="number" id="mic-snap" value="0.01" min="0.001" step="0.001" />
+            </label>
+            <span class="hint" style="margin:0">Click to select · Ctrl+click to add · drag a box to select many · drag to move · arrows nudge · Del removes</span>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="mic-reset">Reset</button>
+          <button class="file-btn" id="mic-apply">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── sweep modal ───────────────────────── -->
+    <div class="modal-overlay" id="sweep-overlay" hidden>
+      <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="sweep-title">
+        <div class="modal-head">
+          <h2 id="sweep-title">Frequency sweep<span class="dim" id="sweep-sub"></span></h2>
+          <button class="modal-close" id="sweep-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="chart-title">−3 dB main-lobe width</div>
+          <div class="chart-host" id="chart-bw"></div>
+          <div class="chart-title">Peak side-lobe level</div>
+          <div class="chart-host" id="chart-psl"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="file-btn" id="sweep-csv">Export CSV</button>
         </div>
       </div>
     </div>

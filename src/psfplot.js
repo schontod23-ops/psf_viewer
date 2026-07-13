@@ -4,27 +4,7 @@
 // square texture (map only) for the 3-D focus plane.
 
 import { contours as d3contours } from "d3-contour";
-import {
-  interpolateTurbo,
-  interpolateViridis,
-  interpolateMagma,
-  interpolateInferno,
-  interpolateCividis,
-  interpolateGreys,
-} from "d3-scale-chromatic";
-
-// Available PSF colormaps, keyed by the value used in the UI/state.
-const COLORMAPS = {
-  turbo: interpolateTurbo,
-  viridis: interpolateViridis,
-  magma: interpolateMagma,
-  inferno: interpolateInferno,
-  cividis: interpolateCividis,
-  greys: interpolateGreys,
-};
-function interpFor(name) {
-  return COLORMAPS[name] || interpolateTurbo;
-}
+import { interpFor } from "./colormap.js";
 
 const MONO = '11px "SF Mono","JetBrains Mono","Roboto Mono",ui-monospace,monospace';
 const INK = "#e7eef7";
@@ -86,6 +66,51 @@ export class PSFPlot {
     const i = Math.max(0, Math.min(nx - 1, Math.round(fx * (nx - 1))));
     const j = Math.max(0, Math.min(ny - 1, Math.round(fy * (ny - 1))));
     return { u: u[i], v: v[j], db: values[j * nx + i] };
+  }
+
+  // Bilinearly sample the current map along the segment (u0,v0)→(u1,v1), in data
+  // coordinates. Returns [[s, dB], …] where `s` is the signed distance along the
+  // cut from its midpoint, so a cut through the peak is centred on 0.
+  sampleLine(u0, v0, u1, v1, n = 240) {
+    if (!this.last) return [];
+    const { nx, ny, u, v, values } = this.last;
+    const uMin = u[0], uMax = u[nx - 1];
+    const vMin = v[0], vMax = v[ny - 1];
+    const len = Math.hypot(u1 - u0, v1 - v0);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const t = n === 1 ? 0 : i / (n - 1);
+      const uu = u0 + t * (u1 - u0);
+      const vv = v0 + t * (v1 - v0);
+      const s = (t - 0.5) * len;
+      // Fractional grid position; NaN outside the map leaves a gap in the chart.
+      const fx = ((uu - uMin) / (uMax - uMin || 1)) * (nx - 1);
+      const fy = ((vv - vMin) / (vMax - vMin || 1)) * (ny - 1);
+      if (fx < 0 || fx > nx - 1 || fy < 0 || fy > ny - 1) {
+        out.push([s, NaN]);
+        continue;
+      }
+      const i0 = Math.min(nx - 2, Math.floor(fx));
+      const j0 = Math.min(ny - 2, Math.floor(fy));
+      const a = fx - i0, b = fy - j0;
+      const q = (ii, jj) => values[jj * nx + ii];
+      const val =
+        q(i0, j0) * (1 - a) * (1 - b) +
+        q(i0 + 1, j0) * a * (1 - b) +
+        q(i0, j0 + 1) * (1 - a) * b +
+        q(i0 + 1, j0 + 1) * a * b;
+      out.push([s, val]);
+    }
+    return out;
+  }
+
+  // Grid coordinates (u, v) of the map's peak — the natural place to centre cuts.
+  peakUV() {
+    if (!this.last) return null;
+    const { nx, u, v, values } = this.last;
+    let best = 0;
+    for (let i = 1; i < values.length; i++) if (values[i] > values[best]) best = i;
+    return { u: u[best % nx], v: v[Math.floor(best / nx)] };
   }
 
   // args: {values, nx, ny, u, v, dynamicDb, levels, showLines, planeLabel}
