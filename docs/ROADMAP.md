@@ -68,7 +68,7 @@ change lands in both engines** unless a feature is explicitly native-only.
 6. **Optional sensor noise floor.** *(done)* White per-sensor variance σ² adds
    `σ²·Σ_m|h_m|²` to the output; diagonal removal cancels it. Exposed as a dB
    slider (`σ² = 10^(dB/10)`) behind an enable checkbox.
-7. **Functional beamforming.** `P(t) = (hᴴ·C^{1/ν}·h)^ν` (Dougherty), which sharpens
+7. **Functional beamforming.** *(done)* `P(t) = (hᴴ·C^{1/ν}·h)^ν` (Dougherty), which sharpens
    the main lobe and suppresses side lobes as the exponent ν grows. Implemented
    **without forming a CSM**: with `C = Σ_s gₛgₛᴴ + σ²I` the signal subspace has
    rank ≤ S (the source count), so its eigenpairs come from the S×S Gram matrix

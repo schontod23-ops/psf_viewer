@@ -43,6 +43,9 @@ const state = {
   c: 343,
   shading: "uniform",
   steering: "I",
+  // beamforming algorithm: "conventional" | "functional" (exponent nu)
+  algorithm: "conventional",
+  nu: 16,
   diagRemoval: false,
   // optional white sensor-noise floor: σ² = 10^(noiseDb/10) when enabled
   noiseEnabled: false,
@@ -126,6 +129,7 @@ bindSlider("frequency", "frequency", (v) => `${v | 0} Hz`);
 bindSlider("dyn", "dyn", (v) => `${v | 0} dB`);
 bindSlider("levels", "levels", (v) => `${v | 0}`);
 bindSlider("noise", "noiseDb", (v) => `${v | 0} dB`);
+bindSlider("nu", "nu", (v) => `${v | 0}`);
 
 // ───────────────────────── slider bounds settings ─────────────────────────
 // Per-slider min/max/step, editable at runtime and persisted so users can
@@ -375,10 +379,22 @@ document.querySelectorAll(".seg").forEach((seg) => {
       state[key] = btn.dataset.val;
       if (key === "source") updateSourceVisibility();
       if (key === "steering") $("lab-steering").textContent = `Formulation ${btn.dataset.val}`;
+      if (key === "algorithm") updateAlgorithmUI();
       schedule();
     });
   });
 });
+
+// Functional beamforming exposes the ν exponent and has no diagonal to remove,
+// so the diagonal-removal toggle is disabled while it is selected.
+function updateAlgorithmUI() {
+  const functional = state.algorithm === "functional";
+  $("nu-field").hidden = !functional;
+  const dr = $("diag-removal");
+  dr.disabled = functional;
+  const row = dr.closest(".check");
+  if (row) row.style.opacity = functional ? "0.45" : "";
+}
 
 function updateSourceVisibility() {
   document.querySelectorAll("[data-when]").forEach((el) => {
@@ -391,6 +407,7 @@ function updateSourceVisibility() {
   });
 }
 updateSourceVisibility();
+updateAlgorithmUI();
 
 // CSV file load
 $("csv-btn").addEventListener("click", () => $("csv-input").click());
@@ -456,12 +473,24 @@ function buildRequest(planeName) {
     focus,
     sources: activeSources(),
     frequency: state.frequency,
+    physics: buildPhysics(),
+  };
+}
+
+// The physics block every engine request carries (mirrors `Physics` in the Rust
+// bridge). Sent as a nested object rather than flattened.
+function buildPhysics() {
+  return {
     speed_of_sound: state.c,
     shading: state.shading,
     steering: state.steering,
     diag_removal: state.diagRemoval,
     // σ² per sensor; 0 disables the noise floor entirely.
     noise_power: state.noiseEnabled ? Math.pow(10, state.noiseDb / 10) : 0,
+    algorithm:
+      state.algorithm === "functional"
+        ? { kind: "functional", nu: state.nu }
+        : { kind: "conventional" },
   };
 }
 
@@ -619,6 +648,7 @@ function exportCsv() {
   lines.push(`# PSF Array Viewer export`);
   lines.push(`# plane=${state.fplane} frequency_Hz=${state.frequency} speed_of_sound_m_s=${state.c}`);
   lines.push(`# steering=${state.steering} shading=${state.shading} diag_removal=${state.diagRemoval} noise_dB=${state.noiseEnabled ? state.noiseDb : "off"}`);
+  lines.push(`# algorithm=${state.algorithm}${state.algorithm === "functional" ? ` nu=${state.nu}` : ""}`);
   lines.push(`# source_m=[${state.srcPos.join(",")}] grid=${res.nx}x${res.ny}`);
   lines.push(`${au}_m,${av}_m,level_dB`);
   for (let j = 0; j < res.ny; j++) {
@@ -834,7 +864,7 @@ function syncAllControls() {
   const sliderMap = {
     n: "n", diameter: "diameter", "ring-n": "ringN", "ring-diameter": "ringDiameter",
     "grid-pitch": "gridPitch", "cross-n": "crossN", "cross-length": "crossLength",
-    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels", noise: "noiseDb",
+    dx: "dx", frequency: "frequency", dyn: "dyn", levels: "levels", noise: "noiseDb", nu: "nu",
   };
   for (const id in sliderMap) {
     const setter = sliderSetters[id];
@@ -858,8 +888,10 @@ function syncAllControls() {
   setSeg("fplane", state.fplane);
   setSeg("shading", state.shading);
   setSeg("steering", state.steering);
+  setSeg("algorithm", state.algorithm);
   setSeg("colormap", state.colormap);
   $("lab-steering").textContent = `Formulation ${state.steering}`;
+  updateAlgorithmUI();
 
   $("src-at-focus").checked = state.srcAtFocus;
   $("src-pos-fields").style.opacity = state.srcAtFocus ? "0.45" : "1";
@@ -1086,6 +1118,65 @@ function gridJS(focus) {
   return { nx, ny, u, v, corners, uh, vh };
 }
 
+// ── small complex linear algebra (functional beamforming only) ──
+// Mirrors psf-core: used only on the S×S source Gram matrix, S = source count.
+const cadd = (a, b) => [a[0] + b[0], a[1] + b[1]];
+const cmul = (a, b) => [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]];
+const cconj = (a) => [a[0], -a[1]];
+
+// Jacobi eigendecomposition of a small complex Hermitian matrix (n×n, row-major).
+// Returns { lambda, v } with eigenvector i in COLUMN i of v. Mirrors
+// psf_core::hermitian_eig — see there for the rotation derivation.
+function hermitianEig(aIn, n) {
+  const a = aIn.map((c) => [c[0], c[1]]);
+  const v = Array.from({ length: n * n }, () => [0, 0]);
+  for (let i = 0; i < n; i++) v[i * n + i] = [1, 0];
+  if (n <= 1) return { lambda: Array.from({ length: n }, (_, i) => a[i * n + i][0]), v };
+
+  for (let sweep = 0; sweep < 60; sweep++) {
+    let off = 0;
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++)
+        if (i !== j) off += a[i * n + j][0] ** 2 + a[i * n + j][1] ** 2;
+    if (Math.sqrt(off) <= 1e-13) break;
+
+    for (let p = 0; p < n; p++) {
+      for (let q = p + 1; q < n; q++) {
+        const apq = a[p * n + q];
+        const r = Math.hypot(apq[0], apq[1]);
+        if (r <= 1e-18) continue;
+        const app = a[p * n + p][0];
+        const aqq = a[q * n + q][0];
+        const phi = Math.atan2(apq[1], apq[0]);
+        const theta = 0.5 * Math.atan2(2 * r, app - aqq);
+        const c = Math.cos(theta), s = Math.sin(theta);
+        const ePos = [Math.cos(phi), Math.sin(phi)];
+        const eNeg = [Math.cos(phi), -Math.sin(phi)];
+        const uPQ = cmul([-s, 0], ePos);
+        const uQP = cmul([s, 0], eNeg);
+
+        for (let i = 0; i < n; i++) {          // A ← A·U (columns p, q)
+          const aip = a[i * n + p], aiq = a[i * n + q];
+          a[i * n + p] = cadd(cmul(aip, [c, 0]), cmul(aiq, uQP));
+          a[i * n + q] = cadd(cmul(aip, uPQ), cmul(aiq, [c, 0]));
+        }
+        const uhPQ = cconj(uQP), uhQP = cconj(uPQ);
+        for (let j = 0; j < n; j++) {          // A ← Uᴴ·A (rows p, q)
+          const apj = a[p * n + j], aqj = a[q * n + j];
+          a[p * n + j] = cadd(cmul([c, 0], apj), cmul(uhPQ, aqj));
+          a[q * n + j] = cadd(cmul(uhQP, apj), cmul([c, 0], aqj));
+        }
+        for (let i = 0; i < n; i++) {          // V ← V·U (columns p, q)
+          const vip = v[i * n + p], viq = v[i * n + q];
+          v[i * n + p] = cadd(cmul(vip, [c, 0]), cmul(viq, uQP));
+          v[i * n + q] = cadd(cmul(vip, uPQ), cmul(viq, [c, 0]));
+        }
+      }
+    }
+  }
+  return { lambda: Array.from({ length: n }, (_, i) => a[i * n + i][0]), v };
+}
+
 // Sarradj (2012) steering-vector formulations — mirrors psf-core/src/lib.rs.
 // x_m(t) = (r0/rm) * exp(-jk(rm - r0)); reference r0 is the array centroid.
 //   I   (classic):       h_m = x_m / |x_m|                (phase only)
@@ -1093,15 +1184,20 @@ function gridJS(focus) {
 //   III (true level):    h_m = x_m / Σ w_m|x_m|²
 //   IV  (true location): h_m = x_m / sqrt(Σw_m * Σ w_m|x_m|²)
 function jsCompute(req) {
+  const phys      = req.physics || {};
   const arr       = buildArrayJS(req);
-  const weights   = weightsForJS(arr, req.shading);
+  const weights   = weightsForJS(arr, phys.shading);
   const f         = req.focus;
   const g         = gridJS(f);
-  const k         = (2 * Math.PI * req.frequency) / req.speed_of_sound;
+  const k         = (2 * Math.PI * req.frequency) / phys.speed_of_sound;
   const reference = centroid(arr.pos);
-  const formulation = req.steering || "I";
-  const diagRemoval  = !!req.diag_removal;
-  const noise        = Math.max(0, req.noise_power || 0);   // σ² per sensor
+  const formulation = phys.steering || "I";
+  const noise        = Math.max(0, phys.noise_power || 0);   // σ² per sensor
+  const algorithm    = phys.algorithm || { kind: "conventional" };
+  const isFunctional = algorithm.kind === "functional";
+  // Diagonal removal is conventional-only — functional reaches C through its
+  // low-rank eigenpairs, where there is no materialised diagonal to strip.
+  const diagRemoval  = !!phys.diag_removal && !isFunctional;
   const sources = (req.sources && req.sources.length)
     ? req.sources
     : [{ pos: req.source || f.center, amplitude: 1 }];
@@ -1126,6 +1222,30 @@ function jsCompute(req) {
   const wsumSafe = Math.abs(wsum) < 1e-30 ? 1 : wsum;
   const needsNormPass = formulation === "III" || formulation === "IV";
   const sRe = new Float64Array(nsrc), sIm = new Float64Array(nsrc), sDiag = new Float64Array(nsrc);
+
+  // Functional beamforming: C = G·Gᴴ + σ²I is low-rank in the sources, so its
+  // eigenpairs come from the S×S Gram matrix M_st = gₛᴴ·g_t — never an N×N CSM.
+  //   hᴴC^{1/ν}h = σ^{2/ν}·‖h‖² + Σ_i [(λ_i+σ²)^{1/ν} − σ^{2/ν}]·|z_i|²/λ_i
+  // with z_i = Σ_s v_{s,i}·Sₛ, so it rides on the per-source projections Sₛ and
+  // ‖h‖² the scan loop already accumulates.
+  let ft = null;
+  if (isFunctional) {
+    const nu = isFinite(algorithm.nu) && algorithm.nu >= 1 ? algorithm.nu : 1;
+    const gram = Array.from({ length: nsrc * nsrc }, () => [0, 0]);
+    for (let s = 0; s < nsrc; s++) {
+      for (let t = 0; t < nsrc; t++) {
+        let acc = [0, 0];
+        for (let mi = 0; mi < p.length; mi++) acc = cadd(acc, cmul(cconj(p[mi][s]), p[mi][t]));
+        gram[s * nsrc + t] = acc;
+      }
+    }
+    const { lambda, v } = hermitianEig(gram, nsrc);
+    const base = Math.pow(noise, 1 / nu);          // σ^{2/ν}  (noise is σ²)
+    const coef = lambda.map((l) =>
+      l <= 1e-30 ? 0 : (Math.pow(l + noise, 1 / nu) - base) / l
+    );
+    ft = { nu, base, coef, v, n: nsrc };
+  }
 
   const raw = new Float64Array(g.nx * g.ny);
   for (let j = 0; j < g.ny; j++) {
@@ -1174,19 +1294,33 @@ function jsCompute(req) {
           if (diagRemoval) sDiag[s2] += hMag2 * (pRe * pRe + pIm * pIm);
         }
       }
-      // Incoherent sum of per-source powers, each with its own autopower
-      // (diagonal) term removed when requested — no CSM is materialised.
-      let power = 0;
-      for (let s2 = 0; s2 < nsrc; s2++) {
-        let ps = sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
-        if (diagRemoval) ps -= sDiag[s2];
-        power += ps;
+      let power;
+      if (ft) {
+        // Functional: P = (hᴴC^{1/ν}h)^ν, from the projections already in hand.
+        let acc = ft.base * hNorm2;
+        for (let idx = 0; idx < ft.n; idx++) {
+          let z = [0, 0];
+          for (let s2 = 0; s2 < ft.n; s2++) {
+            z = cadd(z, cmul(ft.v[s2 * ft.n + idx], [sRe[s2], sIm[s2]]));
+          }
+          acc += ft.coef[idx] * (z[0] * z[0] + z[1] * z[1]);
+        }
+        power = Math.pow(Math.max(0, acc), ft.nu);
+      } else {
+        // Conventional: incoherent sum of per-source powers, each with its own
+        // autopower (diagonal) term removed when requested — no CSM materialised.
+        power = 0;
+        for (let s2 = 0; s2 < nsrc; s2++) {
+          let ps = sRe[s2] * sRe[s2] + sIm[s2] * sIm[s2];
+          if (diagRemoval) ps -= sDiag[s2];
+          power += ps;
+        }
+        // White sensor-noise floor σ²·Σ_m|h_m|² — added to the output, and
+        // stripped again by diagonal removal (which is why DR rejects it).
+        const noiseContrib = noise * hNorm2;
+        power += noiseContrib;
+        if (diagRemoval) power -= noiseContrib;
       }
-      // White sensor-noise floor σ²·Σ_m|h_m|² — added to the output, and
-      // stripped again by diagonal removal (which is why DR rejects it).
-      const noiseContrib = noise * hNorm2;
-      power += noiseContrib;
-      if (diagRemoval) power -= noiseContrib;
       raw[j * g.nx + i] = Math.max(0, power);
     }
   }
@@ -1199,7 +1333,7 @@ function jsCompute(req) {
     values[idx] = Math.max(-300, 10 * Math.log10(raw[idx] / p0 + 1e-30));
   }
 
-  const metrics = metricsJS(arr, g, values, req.speed_of_sound);
+  const metrics = metricsJS(arr, g, values, phys.speed_of_sound);
   // `raw` (un-normalised linear power) is returned alongside the dB map so a
   // sweep can band-average in the power domain before normalising once.
   return { mics: arr.pos, weights, nx: g.nx, ny: g.ny, u: g.u, v: g.v, corners: g.corners, values, raw, metrics };
