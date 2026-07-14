@@ -417,12 +417,14 @@ export class Geometry3D {
   }
 
   // ── STL model ─────────────────────────────────────────────────
-  // Load an STL, transformed by units-scale, rotation and translation. The
-  // mesh itself stays a neutral grey; "painting the PSF" is done by
-  // `surfacePoints()` sampling an area-weighted uniform point cloud over the
-  // mesh surface (the JS equivalent of open3d's sample_points_uniformly) and
-  // `setSurfaceLevels()` rendering the beamformed levels as a coloured
-  // THREE.Points cloud over the mesh.
+  // Load an STL, transformed by units-scale, rotation and translation.
+  // "Painting the PSF" evaluates the beamformer only at a sparse,
+  // density-controlled sample of surface points (`surfacePoints()`, the JS
+  // equivalent of open3d's sample_points_uniformly — evaluating every vertex
+  // of a real STL would be far too slow) and then colours *every* mesh
+  // vertex by propagating the nearest sample's value (`setSurfaceLevels()`,
+  // via a small kd-tree), so the whole surface appears painted rather than
+  // just the sampled points.
 
   /**
    * Parse STL bytes and add the mesh. `xform` converts model units → metres
@@ -442,10 +444,18 @@ export class Geometry3D {
     if (rotZ) geo.rotateZ(THREE.MathUtils.degToRad(rotZ));
     if (tx || ty || tz) geo.translate(tx, ty, tz);
     geo.computeVertexNormals();
+    // Ensure non-indexed so each triangle vertex has its own colour slot.
     const g = geo.index ? geo.toNonIndexed() : geo;
 
+    const n = g.getAttribute("position").count;
+    // RGBA: alpha lets setSurfaceLevels() hide vertices below the dynamic-range floor.
+    const colors = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) { colors[i*4]=0.6; colors[i*4+1]=0.6; colors[i*4+2]=0.6; colors[i*4+3]=1; }
+    g.setAttribute("color", new THREE.BufferAttribute(colors, 4));
+
     const mat = new THREE.MeshPhysicalMaterial({
-      color: 0x999999,
+      vertexColors: true,
+      transparent: true,
       side: THREE.DoubleSide,
       roughness: 0.55,
       metalness: 0.0,
@@ -531,48 +541,37 @@ export class Geometry3D {
     return { points, totalArea };
   }
 
-  /** Render dB levels (one per sampled point) as a coloured point cloud over the mesh. */
+  /**
+   * Colour the whole mesh from dB levels evaluated at a sparse sample of
+   * surface points: every mesh vertex takes the value of its nearest sample
+   * (via a kd-tree over `points`), so the full surface reads as painted
+   * rather than just the evaluated points. Vertices whose nearest sample is
+   * below the dynamic-range floor are made transparent instead of dim.
+   */
   setSurfaceLevels(points, values, dynamicDb, colormap) {
-    this.clearSurfaceLevels();
     if (!this.stlMesh || !points.length) return;
     const lut = rgbLut(colormap);
-    const kept = [];
-    for (let i = 0; i < points.length; i++) {
-      // Below the dynamic-range floor: excluded entirely, not just dim.
-      if (values[i] < -dynamicDb) continue;
-      kept.push(i);
+    const tree = buildKdTree(points);
+    const pos = this.stlMesh.geometry.getAttribute("position");
+    const color = this.stlMesh.geometry.getAttribute("color");
+    const total = color.count;
+    for (let i = 0; i < total; i++) {
+      const s = kdNearest(tree, points, pos.getX(i), pos.getY(i), pos.getZ(i));
+      const v = values[s];
+      const [r, g, b] = lutColor(lut, v, dynamicDb);
+      const a = v < -dynamicDb ? 0 : 1;
+      color.setXYZW(i, r, g, b, a);
     }
-    const positions = new Float32Array(kept.length * 3);
-    const colors = new Float32Array(kept.length * 3);
-    kept.forEach((i, k) => {
-      const [x, y, z] = points[i];
-      positions[k*3] = x; positions[k*3+1] = y; positions[k*3+2] = z;
-      const [r, g, b] = lutColor(lut, values[i], dynamicDb);
-      colors[k*3] = r; colors[k*3+1] = g; colors[k*3+2] = b;
-    });
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-    const mat = new THREE.PointsMaterial({
-      size: 0.01,
-      vertexColors: true,
-      transparent: true,
-      depthWrite: false,
-      sizeAttenuation: true,
-      opacity: 0.95,
-    });
-    this.stlPoints = new THREE.Points(geo, mat);
-    this.scene.add(this.stlPoints);
+    color.needsUpdate = true;
     this._markDirty();
   }
 
-  /** Remove the surface point cloud (PSF painting switched off). */
+  /** Reset the mesh to a neutral opaque grey (PSF painting switched off). */
   clearSurfaceLevels() {
-    if (!this.stlPoints) return;
-    this.scene.remove(this.stlPoints);
-    this.stlPoints.geometry.dispose();
-    this.stlPoints.material.dispose();
-    this.stlPoints = null;
+    if (!this.stlMesh) return;
+    const color = this.stlMesh.geometry.getAttribute("color");
+    for (let i = 0; i < color.count; i++) color.setXYZW(i, 0.6, 0.6, 0.6, 1);
+    color.needsUpdate = true;
     this._markDirty();
   }
 
@@ -622,4 +621,41 @@ function makeAxes(len) {
   g.add(mk([0,len,0], 0x6b7d99));
   g.add(mk([0,0,len], 0x6b7d99));
   return g;
+}
+
+// ── tiny 3-D kd-tree (nearest-neighbour only) ─────────────────────
+// Used to propagate a sparse sample of evaluated surface points onto every
+// mesh vertex, so setSurfaceLevels() can colour the whole STL surface.
+function buildKdTree(points) {
+  function build(indices, depth) {
+    if (!indices.length) return null;
+    const axis = depth % 3;
+    indices.sort((a, b) => points[a][axis] - points[b][axis]);
+    const mid = indices.length >> 1;
+    return {
+      idx: indices[mid],
+      axis,
+      left: build(indices.slice(0, mid), depth + 1),
+      right: build(indices.slice(mid + 1), depth + 1),
+    };
+  }
+  return build(points.map((_, i) => i), 0);
+}
+
+function kdNearest(root, points, x, y, z) {
+  let best = -1, bestD2 = Infinity;
+  const q = [x, y, z];
+  (function visit(node) {
+    if (!node) return;
+    const p = points[node.idx];
+    const dx = p[0] - x, dy = p[1] - y, dz = p[2] - z;
+    const d2 = dx*dx + dy*dy + dz*dz;
+    if (d2 < bestD2) { bestD2 = d2; best = node.idx; }
+    const diff = q[node.axis] - p[node.axis];
+    const near = diff < 0 ? node.left : node.right;
+    const far  = diff < 0 ? node.right : node.left;
+    visit(near);
+    if (diff * diff < bestD2) visit(far);
+  })(root);
+  return best;
 }
