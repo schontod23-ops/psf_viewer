@@ -30,8 +30,8 @@
 
       <!-- ───────────────────────── controls ───────────────────────── -->
       <aside class="rail" id="rail">
-        <section class="group">
-          <div class="eyebrow">Array</div>
+        <details class="group" open data-sec="array">
+          <summary class="eyebrow">Array</summary>
 
           <div class="seg wrap" data-seg="source">
             <button data-val="sunflower" class="on">Sunflower</button>
@@ -140,10 +140,10 @@
 
           <button class="file-btn" id="mic-edit" style="margin-top:12px">Edit microphones…</button>
           <p class="hint">Move individual microphones. Editing turns the array into a hand-edited layout.</p>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Focus plane</div>
+        <details class="group" open data-sec="focus-plane">
+          <summary class="eyebrow">Focus plane</summary>
           <div class="field">
             <span>Plane</span>
             <div class="seg sm" data-seg="fplane">
@@ -171,10 +171,10 @@
               <input type="number" id="dx-num" class="slider-num" min="0.005" max="0.1" step="0.005" value="0.02" aria-label="grid step dx (m)" />
             </div>
           </label>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Source</div>
+        <details class="group" open data-sec="source">
+          <summary class="eyebrow">Source</summary>
           <label class="check" style="margin-bottom:10px">
             <input type="checkbox" id="src-at-focus" />
             <span>Source at focus centre</span>
@@ -193,19 +193,30 @@
             <button class="file-btn" id="add-source">+ Add source</button>
             <p class="hint">Extra incoherent sources (x, y, z, amplitude). The map is the incoherent power sum.</p>
           </div>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">3-D View</div>
+        <details class="group" open data-sec="3d-view">
+          <summary class="eyebrow">3-D View</summary>
+          <div class="field">
+            <span>Panels</span>
+            <div class="seg sm" data-seg="viewmode">
+              <button data-val="both" class="on">Both</button>
+              <button data-val="3d">3-D</button>
+              <button data-val="2d">2-D</button>
+            </div>
+          </div>
           <label class="check" style="margin-bottom:10px">
             <input type="checkbox" id="multiplane" />
             <span>Show all focus planes (xy / xz / yz)</span>
           </label>
           <label class="check">
-            <input type="checkbox" id="raytrace" />
-            <span>Path tracing<span class="hint" style="display:inline;margin:0 0 0 6px;font-size:9.5px">(progressive)</span></span>
+            <input type="checkbox" id="plane-fade" checked />
+            <span>Fade inactive focus planes</span>
           </label>
-
+          <label class="check">
+            <input type="checkbox" id="mic-color-weight" />
+            <span>Color microphones by weight</span>
+          </label>
           <div class="field" style="margin-top:14px">
             <span>3-D model (STL)</span>
             <button class="file-btn" id="stl-btn">Load STL…</button>
@@ -217,17 +228,37 @@
               <label><span>Units → m</span><input type="number" id="stl-scale" value="1" min="0.0001" step="0.001" /></label>
               <label><span>&nbsp;</span><button class="file-btn" id="stl-clear">Remove</button></label>
             </div>
+            <div class="field">
+              <span>Rotation (deg, X/Y/Z)</span>
+              <div class="triple">
+                <input type="number" id="stl-rx" value="0" step="1" aria-label="STL rotation X" />
+                <input type="number" id="stl-ry" value="0" step="1" aria-label="STL rotation Y" />
+                <input type="number" id="stl-rz" value="0" step="1" aria-label="STL rotation Z" />
+              </div>
+            </div>
+            <div class="field">
+              <span>Translation (m, X/Y/Z)</span>
+              <div class="triple">
+                <input type="number" id="stl-tx" value="0" step="0.01" aria-label="STL translation X" />
+                <input type="number" id="stl-ty" value="0" step="0.01" aria-label="STL translation Y" />
+                <input type="number" id="stl-tz" value="0" step="0.01" aria-label="STL translation Z" />
+              </div>
+            </div>
+            <label class="field">
+              <span>Point density (pts/m²)</span>
+              <input type="number" id="stl-density" value="2000" min="1" step="100" />
+            </label>
             <label class="check">
               <input type="checkbox" id="stl-psf" />
               <span>Paint PSF on surface</span>
             </label>
             <button class="file-btn" id="stl-run" style="margin-top:10px" hidden>Evaluate surface</button>
-            <p class="hint">Evaluated at up to 4000 surface samples — press Evaluate after changing the setup.</p>
+            <p class="hint">Uniformly sampled over the surface at the chosen density — press Evaluate after changing the setup.</p>
           </div>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Physics</div>
+        <details class="group" open data-sec="physics">
+          <summary class="eyebrow">Physics</summary>
           <label class="field">
             <span>Frequency <em id="lab-f">5000 Hz</em></span>
             <div class="slider-num-row">
@@ -283,10 +314,10 @@
             <input type="range" id="noise" min="-80" max="0" step="1" value="-40" />
             <p class="hint">Per-sensor white noise, σ² = 10^(dB/10). Diagonal removal cancels it.</p>
           </label>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Display</div>
+        <details class="group" open data-sec="display">
+          <summary class="eyebrow">Display</summary>
           <label class="field">
             <span>Dynamic range <em id="lab-dyn">30 dB</em></span>
             <input type="range" id="dyn" min="6" max="60" step="1" value="30" />
@@ -315,10 +346,10 @@
             <span>1-D line cut</span>
           </label>
           <p class="hint">Cuts through the peak along u and v. "Pin" keeps a cut on the chart so you can compare settings.</p>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Analysis</div>
+        <details class="group" open data-sec="analysis">
+          <summary class="eyebrow">Analysis</summary>
           <div class="field grid2">
             <label><span>f min (Hz)</span><input type="number" id="sweep-fmin" value="1000" min="1" step="100" /></label>
             <label><span>f max (Hz)</span><input type="number" id="sweep-fmax" value="10000" min="1" step="100" /></label>
@@ -344,11 +375,12 @@
             <button class="file-btn" id="sweep-run">Run sweep</button>
             <button class="file-btn" id="sweep-open" disabled>Charts…</button>
           </div>
+          <progress id="sweep-progress" value="0" max="1" hidden style="width:100%;margin-top:8px"></progress>
           <p class="hint">Sweeps the band and plots beamwidth and peak side-lobe vs frequency. Not live — press Run.</p>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Compare</div>
+        <details class="group" open data-sec="compare">
+          <summary class="eyebrow">Compare</summary>
           <div class="field grid2">
             <button class="file-btn" id="snap-a">Snapshot A</button>
             <button class="file-btn" id="snap-b">Snapshot B</button>
@@ -358,22 +390,22 @@
             <button class="file-btn" id="compare-open" disabled>Compare…</button>
             <button class="file-btn" id="report-btn">Report (PDF)</button>
           </div>
-        </section>
+        </details>
 
-        <section class="group">
-          <div class="eyebrow">Configuration</div>
+        <details class="group" open data-sec="configuration">
+          <summary class="eyebrow">Configuration</summary>
           <div class="field grid2">
             <button class="file-btn" id="config-save">Save…</button>
             <button class="file-btn" id="config-load">Load…</button>
           </div>
           <input type="file" id="config-input" accept=".json" hidden />
           <p class="hint">Save the full setup (array, focus, physics, display) to a JSON file, or load one back.</p>
-        </section>
+        </details>
       </aside>
 
       <!-- ───────────────────────── stages ───────────────────────── -->
       <main class="stage stage-3d">
-        <div class="panel-label">Geometry<span class="dim"> · drag to rotate</span><span class="rt-badge" id="rt-badge" hidden> · path tracing</span></div>
+        <div class="panel-label">Geometry<span class="dim"> · drag to rotate</span></div>
         <div id="three" class="canvas-host"></div>
       </main>
 

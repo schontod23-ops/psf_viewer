@@ -16,6 +16,16 @@ function getInvoke() {
   return invokePromise;
 }
 
+let listenPromise = null;
+function getListen() {
+  if (!isTauri) return Promise.resolve(null);
+  if (!listenPromise)
+    listenPromise = import("@tauri-apps/api/event")
+      .then((m) => m.listen)
+      .catch(() => null);
+  return listenPromise;
+}
+
 // ───────────────────────── state ─────────────────────────
 const state = {
   source: "sunflower",
@@ -66,10 +76,18 @@ const state = {
   extraSources: [],
   // 3D options
   multiplane: false,
-  raytrace: false,
+  planeFade: true,
+  micColorByWeight: false,
   // STL model (the geometry itself is not persisted — only how to interpret it)
   stlName: null,
   stlScale: 1,
+  stlRotX: 0,
+  stlRotY: 0,
+  stlRotZ: 0,
+  stlTx: 0,
+  stlTy: 0,
+  stlTz: 0,
+  stlDensity: 2000,
   stlPsf: false,
   // broadband sweep
   sweepFmin: 1000,
@@ -361,11 +379,14 @@ $("multiplane").addEventListener("change", (e) => {
   schedule();
 });
 
-// Ray-trace toggle
-$("raytrace").addEventListener("change", (e) => {
-  state.raytrace = e.target.checked;
-  $("rt-badge").hidden = !state.raytrace;
-  geo.setRaytrace(state.raytrace);
+$("plane-fade").addEventListener("change", (e) => {
+  state.planeFade = e.target.checked;
+  geo.setPlaneFade(state.planeFade);
+});
+
+$("mic-color-weight").addEventListener("change", (e) => {
+  state.micColorByWeight = e.target.checked;
+  geo.setMicColorByWeight(state.micColorByWeight);
 });
 
 $("diag-removal").addEventListener("change", (e) => {
@@ -392,6 +413,10 @@ document.querySelectorAll(".seg").forEach((seg) => {
       seg.querySelectorAll("button").forEach((b) => b.classList.remove("on"));
       btn.classList.add("on");
       state[key] = btn.dataset.val;
+      if (key === "viewmode") {
+        applyViewMode(btn.dataset.val);
+        return;
+      }
       if (key === "source") updateSourceVisibility();
       if (key === "steering") $("lab-steering").textContent = `Formulation ${btn.dataset.val}`;
       if (key === "algorithm") updateAlgorithmUI();
@@ -411,6 +436,17 @@ function updateAlgorithmUI() {
   if (row) row.style.opacity = functional ? "0.45" : "";
 }
 
+// ───────────────────────── 2-D / 3-D view toggle ─────────────────────────
+const VIEW_MODE_KEY = "psf-view-mode";
+function applyViewMode(mode) {
+  const app = document.querySelector(".app");
+  app.classList.remove("hide-3d", "hide-psf");
+  if (mode === "3d") app.classList.add("hide-psf");
+  else if (mode === "2d") app.classList.add("hide-3d");
+  localStorage.setItem(VIEW_MODE_KEY, mode);
+  geo.resize();
+}
+
 function updateSourceVisibility() {
   document.querySelectorAll("[data-when]").forEach((el) => {
     const [k, v] = el.dataset.when.split("=");
@@ -423,6 +459,28 @@ function updateSourceVisibility() {
 }
 updateSourceVisibility();
 updateAlgorithmUI();
+
+// Restore the last view-mode choice (default "both" if none saved).
+{
+  const savedMode = localStorage.getItem(VIEW_MODE_KEY) || "both";
+  setSeg("viewmode", savedMode);
+  applyViewMode(savedMode);
+}
+
+// ───────────────────────── collapsible sidebar sections ─────────────────────────
+const SECTION_STATE_KEY = "psf-sections";
+{
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(SECTION_STATE_KEY)) || {}; } catch { saved = {}; }
+  document.querySelectorAll("details[data-sec]").forEach((el) => {
+    const id = el.dataset.sec;
+    if (id in saved) el.open = saved[id];
+    el.addEventListener("toggle", () => {
+      saved[id] = el.open;
+      localStorage.setItem(SECTION_STATE_KEY, JSON.stringify(saved));
+    });
+  });
+}
 
 // CSV file load
 $("csv-btn").addEventListener("click", () => $("csv-input").click());
@@ -718,7 +776,10 @@ function openMicEditor() {
   $("mic-overlay").hidden = false;
   if (!micEditor) {
     micEditor = new MicEditor($("mic-canvas"));
-    micEditor.onChange = updateMicSub;
+    micEditor.onChange = () => {
+      updateMicSub();
+      scheduleMicPreview();
+    };
   }
   // Editing happens in the array's own plane (out-of-plane offsets are preserved).
   micEditor.load(res.mics.map((p) => p.slice()), state.aplane);
@@ -744,6 +805,41 @@ function applyMicSnap() {
 
 function closeMicEditor() {
   $("mic-overlay").hidden = true;
+  clearTimeout(micPreviewTimer);
+  // Revert the live preview if the edit wasn't applied.
+  const res = lastResults[state.fplane];
+  if (res) {
+    geo.previewMics(res.mics, res.weights);
+    drawPlot(res);
+  }
+}
+
+// Live preview while dragging in the editor: the 3-D mic cloud moves
+// immediately, and a debounced recompute (same 140 ms cadence as `schedule()`)
+// keeps the PSF map in sync without waiting for "Apply".
+let micPreviewTimer = null;
+function scheduleMicPreview() {
+  if (!micEditor) return;
+  geo.previewMics(micEditor.positions());
+  clearTimeout(micPreviewTimer);
+  micPreviewTimer = setTimeout(runMicPreview, 140);
+}
+
+async function runMicPreview() {
+  if (!micEditor || !micEditor.count()) return;
+  const before = lastResults[state.fplane];
+  const pos = micEditor.positions();
+  const w = before && before.weights;
+  const weights = w && w.length === pos.length ? w.slice() : null;
+  const req = { ...buildRequest(state.fplane), array: { kind: "manual", pos, weights } };
+  try {
+    const inv = await getInvoke();
+    const res = inv ? await inv("compute", { req }) : jsCompute(req);
+    drawPlot(res);
+    geo.previewMics(res.mics, res.weights);
+  } catch {
+    // Ignore transient errors while dragging — the next step will retry.
+  }
 }
 
 $("mic-edit").addEventListener("click", openMicEditor);
@@ -783,23 +879,37 @@ $("mic-apply").addEventListener("click", () => {
 
 // ───────────────────────── STL model + surface PSF ─────────────────────────
 // The model is parsed client-side (three.js STLLoader). Painting the PSF onto it
-// beamforms the mesh's surface samples through the same engine core the map uses
-// (compute_on_points / beamformPointsJS), so map and model always agree.
-const SURFACE_BUDGET = 4000;
-let stlBuffer = null;   // kept so a units-scale change can re-parse
-let stlSample = null;   // { points, stride, total } from the last load
+// beamforms an area-weighted uniform surface sample through the same engine
+// core the map uses (compute_on_points / beamformPointsJS), so map and model
+// always agree.
+let stlBuffer = null;   // kept so a transform change can re-parse
+let stlSample = null;   // { points, totalArea } from the last load
 
 function showStlControls(on) {
   document.querySelectorAll("[data-when-stl]").forEach((el) => (el.hidden = !on));
   $("stl-run").hidden = !(on && state.stlPsf);
 }
 
-function loadStlBuffer(buffer, scale) {
-  const count = geo.loadSTL(buffer, scale);
-  stlSample = geo.surfacePoints(SURFACE_BUDGET);
+function stlXform() {
+  return {
+    scale: state.stlScale,
+    rotX: state.stlRotX, rotY: state.stlRotY, rotZ: state.stlRotZ,
+    tx: state.stlTx, ty: state.stlTy, tz: state.stlTz,
+  };
+}
+
+function loadStlBuffer(buffer, xform) {
+  const count = geo.loadSTL(buffer, xform);
+  resampleStl();
   $("stl-status").textContent =
     `${state.stlName || "model"} · ${count.toLocaleString()} vertices · ${stlSample.points.length.toLocaleString()} samples`;
   showStlControls(true);
+  if (state.stlPsf) runSurfacePsf();
+}
+
+/** Redraw the surface sample cloud at the current density (no re-parse needed). */
+function resampleStl() {
+  stlSample = geo.surfacePoints(state.stlDensity);
   if (state.stlPsf) runSurfacePsf();
 }
 
@@ -818,7 +928,7 @@ async function runSurfacePsf() {
     };
     const inv = await getInvoke();
     const res = inv ? await inv("compute_on_points", { req }) : jsComputeOnPoints(req);
-    geo.setSurfaceLevels(res.values, stlSample.stride, state.dyn, state.colormap);
+    geo.setSurfaceLevels(stlSample.points, res.values, state.dyn, state.colormap);
   } catch (e) {
     toast(typeof e === "string" ? e : e.message || "Surface evaluation failed.");
   } finally {
@@ -836,7 +946,7 @@ $("stl-input").addEventListener("change", (e) => {
     try {
       stlBuffer = reader.result;
       state.stlName = file.name;
-      loadStlBuffer(stlBuffer, state.stlScale);
+      loadStlBuffer(stlBuffer, stlXform());
     } catch {
       toast("Could not parse that STL.");
     }
@@ -861,7 +971,32 @@ $("stl-scale").addEventListener("change", (e) => {
   const v = parseFloat(e.target.value);
   if (!(v > 0) || !stlBuffer) return;
   state.stlScale = v;
-  loadStlBuffer(stlBuffer, v);   // re-parse: geometry.scale() is not reversible
+  loadStlBuffer(stlBuffer, stlXform());   // re-parse: geometry transforms are not reversible
+});
+
+// Rotation/translation also bake into the geometry, so they re-parse too.
+function bindStlTransform(id, key) {
+  $(id).addEventListener("change", (e) => {
+    const v = parseFloat(e.target.value);
+    if (!isFinite(v) || !stlBuffer) return;
+    state[key] = v;
+    loadStlBuffer(stlBuffer, stlXform());
+  });
+}
+bindStlTransform("stl-rx", "stlRotX");
+bindStlTransform("stl-ry", "stlRotY");
+bindStlTransform("stl-rz", "stlRotZ");
+bindStlTransform("stl-tx", "stlTx");
+bindStlTransform("stl-ty", "stlTy");
+bindStlTransform("stl-tz", "stlTz");
+
+$("stl-density").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (!(v > 0) || !stlBuffer) return;
+  state.stlDensity = v;
+  resampleStl();
+  $("stl-status").textContent =
+    `${state.stlName || "model"} · ${stlSample.points.length.toLocaleString()} samples`;
 });
 
 $("stl-psf").addEventListener("change", (e) => {
@@ -900,12 +1035,26 @@ async function runSweep() {
     return;
   }
   const btn = $("sweep-run");
+  const bar = $("sweep-progress");
   btn.disabled = true;
   btn.textContent = "Running…";
+  bar.value = 0;
+  bar.hidden = false;
+  let unlisten = null;
   try {
     const req = buildSweepRequest();
     const inv = await getInvoke();
-    lastSweep = inv ? await inv("compute_sweep", { req }) : jsComputeSweep(req);
+    if (inv) {
+      const listen = await getListen();
+      if (listen) {
+        unlisten = await listen("sweep-progress", (e) => {
+          bar.value = e.payload.step / e.payload.total;
+        });
+      }
+      lastSweep = await inv("compute_sweep", { req });
+    } else {
+      lastSweep = await jsComputeSweep(req, (step, total) => { bar.value = step / total; });
+    }
 
     $("sweep-open").disabled = false;
     const hasBand = !!lastSweep.band_values;
@@ -921,8 +1070,10 @@ async function runSweep() {
   } catch (e) {
     toast(typeof e === "string" ? e : e.message || "Sweep failed.");
   } finally {
+    if (unlisten) unlisten();
     btn.disabled = false;
     btn.textContent = "Run sweep";
+    bar.hidden = true;
   }
 }
 
@@ -1178,8 +1329,8 @@ function syncAllControls() {
   $("src-pos-fields").style.opacity = state.srcAtFocus ? "0.45" : "1";
   $("src-pos-fields").style.pointerEvents = state.srcAtFocus ? "none" : "";
   $("multiplane").checked = state.multiplane;
-  $("raytrace").checked = state.raytrace;
-  $("rt-badge").hidden = !state.raytrace;
+  $("plane-fade").checked = state.planeFade;
+  $("mic-color-weight").checked = state.micColorByWeight;
 
   // The STL geometry itself is never persisted (only the units scale), so a
   // restored session always starts without a model loaded.
@@ -1187,6 +1338,13 @@ function syncAllControls() {
   state.stlPsf = false;
   $("stl-psf").checked = false;
   $("stl-scale").value = state.stlScale;
+  $("stl-rx").value = state.stlRotX;
+  $("stl-ry").value = state.stlRotY;
+  $("stl-rz").value = state.stlRotZ;
+  $("stl-tx").value = state.stlTx;
+  $("stl-ty").value = state.stlTy;
+  $("stl-tz").value = state.stlTz;
+  $("stl-density").value = state.stlDensity;
   showStlControls(false);
   $("diag-removal").checked = state.diagRemoval;
   $("noise-enable").checked = state.noiseEnabled;
@@ -1212,7 +1370,8 @@ function syncAllControls() {
   updateSourceVisibility();
   renderExtraSources();
   geo.setMultiplane(state.multiplane);
-  geo.setRaytrace(state.raytrace);
+  geo.setPlaneFade(state.planeFade);
+  geo.setMicColorByWeight(state.micColorByWeight);
   geo.updateSource(state.srcPos);
   geo.updateExtraSources(state.extraSources);
 }
@@ -1907,13 +2066,16 @@ function sweepFrequenciesJS(fMin, fMax, n, log) {
 
 // Mirrors psf_core::compute_sweep — per-frequency metrics plus an optional
 // incoherent (power-domain) band average, normalised once at the end.
-function jsComputeSweep(req) {
+// `onStep(step, total)`, if given, is called after each frequency, yielding to
+// the event loop every few steps so the caller's progress bar can repaint.
+async function jsComputeSweep(req, onStep) {
   const freqs = sweepFrequenciesJS(req.f_min, req.f_max, req.n_points, req.log_spacing);
   const points = [];
   let band = null;
   let first = null;
 
-  for (const f of freqs) {
+  for (let i = 0; i < freqs.length; i++) {
+    const f = freqs[i];
     const r = jsCompute({ ...req, frequency: f });
     if (!first) first = r;
     if (req.band_map) {
@@ -1926,6 +2088,8 @@ function jsComputeSweep(req) {
       beamwidth_v: r.metrics.beamwidth_v,
       peak_sidelobe_db: r.metrics.peak_sidelobe_db,
     });
+    if (onStep) onStep(i + 1, freqs.length);
+    if (i % 4 === 3) await new Promise((r) => setTimeout(r));
   }
 
   let band_values = null;

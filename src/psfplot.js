@@ -162,10 +162,10 @@ export class PSFPlot {
     const tx = (gx) => (gx / (nx - 1)) * texW;
     const ty = (gy) => texH - (gy / (ny - 1)) * texH; // flip: +v up
 
+    // Cells below the dynamic-range floor are left transparent (cleared, not
+    // filled) instead of taking the lowest band colour, so they read as
+    // "not visible" rather than a false floor colour.
     tctx.clearRect(0, 0, texW, texH);
-    // base fill = lowest band colour
-    tctx.fillStyle = interp(0);
-    tctx.fillRect(0, 0, texW, texH);
     for (const g of geoms) {
       const s = (g.value + dynamicDb) / dynamicDb; // 0..1
       tctx.fillStyle = interp(Math.max(0, Math.min(1, s)));
@@ -353,8 +353,6 @@ export class PSFPlot {
     const tx = (gx) => (gx / (nx - 1)) * W;
     const ty = (gy) => H - (gy / (ny - 1)) * H;
     ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = interp(0);
-    ctx.fillRect(0, 0, W, H);
     for (const g of geoms) {
       const s = (g.value + dynamicDb) / dynamicDb;
       ctx.fillStyle = interp(Math.max(0, Math.min(1, s)));

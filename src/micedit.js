@@ -171,6 +171,7 @@ export class MicEditor {
           this.pts[s.i].u = this._snap(s.u + du);
           this.pts[s.i].v = this._snap(s.v + dv);
         }
+        if (this.onChange) this.onChange();
       } else {
         this.drag.px = px;
         this.drag.py = py;

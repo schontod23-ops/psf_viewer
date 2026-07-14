@@ -1147,6 +1147,7 @@ pub fn compute_sweep(
     frequencies: &[f64],
     opts: &BeamformOptions,
     band_map: bool,
+    mut on_step: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Result<SweepResult, String> {
     if frequencies.is_empty() {
         return Err("Sweep needs at least one frequency point.".into());
@@ -1165,7 +1166,7 @@ pub fn compute_sweep(
     // on frequency — capture them once from the first pass.
     let mut geometry: Option<Metrics> = None;
 
-    for &f in frequencies {
+    for (i, &f) in frequencies.iter().enumerate() {
         let step = BeamformOptions { frequency: f, ..*opts };
         let raw = compute_at_points(array, weights, &points, sources, &step)?;
         if band_map {
@@ -1183,6 +1184,9 @@ pub fn compute_sweep(
         });
         if geometry.is_none() {
             geometry = Some(m);
+        }
+        if let Some(cb) = on_step.as_mut() {
+            cb(i + 1, frequencies.len());
         }
     }
 
@@ -1806,6 +1810,7 @@ mod tests {
             // `frequency` here is a placeholder — compute_sweep overrides it per step.
             &opts(1000.0),
             false,
+            None,
         )
         .unwrap();
 
@@ -1835,6 +1840,7 @@ mod tests {
             &freqs,
             &opts(1000.0), // overridden per sweep step
             true,
+            None,
         )
         .unwrap();
 

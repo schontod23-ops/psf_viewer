@@ -7,6 +7,15 @@ use psf_core::{
     Shading, Source, SteeringFormulation, SweepResult,
 };
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+
+/// Payload for the `sweep-progress` event emitted once per swept frequency,
+/// so the frontend can show a determinate progress bar during a sweep.
+#[derive(Clone, Serialize)]
+struct SweepProgress {
+    step: usize,
+    total: usize,
+}
 
 /// The physics settings every request carries, sent by the frontend as a nested
 /// `physics` object and folded into a `BeamformOptions` here. Deliberately not
@@ -103,23 +112,33 @@ pub struct SweepRequest {
 }
 
 /// Resolve the array, sweep the beamformer across the frequency band, and return
-/// per-frequency metrics plus (optionally) the band-averaged map.
+/// per-frequency metrics plus (optionally) the band-averaged map. Runs on a
+/// blocking thread and emits `sweep-progress` after each frequency step so the
+/// frontend can show a determinate progress bar.
 #[tauri::command]
-fn compute_sweep(req: SweepRequest) -> Result<SweepResult, String> {
-    let array = build_array(&req.array)?;
-    let weights = weights_for(&array, req.physics.shading);
-    let frequencies = sweep_frequencies(req.f_min, req.f_max, req.n_points, req.log_spacing)?;
-    // `frequency` is overridden for each swept step.
-    let opts = req.physics.options(frequencies[0]);
-    psf_core::compute_sweep(
-        &array,
-        &weights,
-        &req.focus,
-        &req.sources,
-        &frequencies,
-        &opts,
-        req.band_map,
-    )
+async fn compute_sweep(app: tauri::AppHandle, req: SweepRequest) -> Result<SweepResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let array = build_array(&req.array)?;
+        let weights = weights_for(&array, req.physics.shading);
+        let frequencies = sweep_frequencies(req.f_min, req.f_max, req.n_points, req.log_spacing)?;
+        // `frequency` is overridden for each swept step.
+        let opts = req.physics.options(frequencies[0]);
+        let mut on_step = |step: usize, total: usize| {
+            let _ = app.emit("sweep-progress", SweepProgress { step, total });
+        };
+        psf_core::compute_sweep(
+            &array,
+            &weights,
+            &req.focus,
+            &req.sources,
+            &frequencies,
+            &opts,
+            req.band_map,
+            Some(&mut on_step),
+        )
+    })
+    .await
+    .map_err(|e| format!("Sweep task panicked: {e}"))?
 }
 
 /// Beamform at an arbitrary set of world-space points — used to paint the PSF

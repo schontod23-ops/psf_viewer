@@ -1,26 +1,9 @@
 // geometry3d.js — 3-D scene: array geometry, multi-plane PSF quads, source marker.
-// Optional path-tracing via three-gpu-pathtracer (must be installed separately:
-//   npm install three-gpu-pathtracer
-// Falls back silently to standard WebGL renderer if the package is absent.
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { rgbLut, lutColor } from "./colormap.js";
-
-// Lazy-load the path tracer so the app works without the package
-let PathTracerModule = null;
-async function loadPathTracer() {
-  if (PathTracerModule) return PathTracerModule;
-  try {
-    // @vite-ignore — optional, not bundled; resolved only if the package is
-    // present at runtime. Absence is caught below and falls back to WebGL.
-    PathTracerModule = await import(/* @vite-ignore */ "three-gpu-pathtracer");
-    return PathTracerModule;
-  } catch {
-    return null;
-  }
-}
 
 // ── plane metadata ───────────────────────────────────────────────
 const PLANES = ["xy", "xz", "yz"];
@@ -163,13 +146,11 @@ export class Geometry3D {
     // State
     this._framed    = false;
     this._multiplane = false;
+    this._planeFade  = true;
+    this._micColorByWeight = false;
+    this._lastMics    = null;
+    this._lastWeights = null;
     this._activePlane = "xy";
-
-    // Path tracer state
-    this._raytrace    = false;
-    this._ptRenderer  = null;  // PathTracingRenderer instance
-    this._ptReady     = false;
-    this._ptDirty     = false;
 
     this._raf     = 0;
     this._animate = this._animate.bind(this);
@@ -184,10 +165,6 @@ export class Geometry3D {
     this.renderer.setSize(r.width, r.height, false);
     this.camera.aspect = r.width / r.height;
     this.camera.updateProjectionMatrix();
-    if (this._ptRenderer) {
-      this._ptRenderer.setSize(r.width, r.height);
-      this._ptRenderer.reset();
-    }
   }
 
   // Called by main.js whenever the PSF texture for a given plane is ready
@@ -211,29 +188,74 @@ export class Geometry3D {
     this._markDirty();
   }
 
-  // mics, weights, corners are for the primary (active) plane
-  // allResults: { xy, xz, yz } — corners needed to position other planes
-  update(mics, weights, corners, activePlane, allResults, multiplane) {
-    this._activePlane = activePlane || "xy";
-    this._multiplane  = multiplane || false;
+  setPlaneFade(enabled) {
+    this._planeFade = enabled;
+    this._syncPlaneVisibility();
+    this._markDirty();
+  }
 
-    // ── microphones ──
+  /** Cheap live update of just the mic point cloud (e.g. while dragging in the editor). */
+  previewMics(mics, weights) {
+    this._lastMics = mics;
+    if (weights) this._lastWeights = weights;
+    this._buildMicPoints();
+    this._markDirty();
+  }
+
+  setMicColorByWeight(enabled) {
+    this._micColorByWeight = enabled;
+    if (this._lastMics) this._buildMicPoints();
+    this._markDirty();
+  }
+
+  /** Rebuild the microphone point cloud, optionally colored by weight. */
+  _buildMicPoints() {
+    const mics = this._lastMics || [];
+    const weights = this._lastWeights || [];
     this.micGroup.clear();
     const positions = new Float32Array(mics.length * 3);
     mics.forEach((p, i) => { positions[i*3]=p[0]; positions[i*3+1]=p[1]; positions[i*3+2]=p[2]; });
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    const mat = new THREE.PointsMaterial({
+
+    const matOpts = {
       size: 0.05,
       map: this.micSprite,
       transparent: true,
       depthWrite: false,
       sizeAttenuation: true,
-      color: 0x9fe6ff,
       opacity: 0.95,
       blending: THREE.AdditiveBlending,
-    });
-    this.micGroup.add(new THREE.Points(geo, mat));
+    };
+
+    if (this._micColorByWeight && weights.length === mics.length && mics.length) {
+      const lut = rgbLut("turbo");
+      const wMin = Math.min(...weights), wMax = Math.max(...weights);
+      const span = wMax - wMin || 1;
+      const colors = new Float32Array(mics.length * 3);
+      weights.forEach((w, i) => {
+        const t = (w - wMin) / span;
+        const idx = Math.min(255, Math.max(0, Math.round(t * 255)));
+        colors[i*3] = lut[idx*3]; colors[i*3+1] = lut[idx*3+1]; colors[i*3+2] = lut[idx*3+2];
+      });
+      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      matOpts.vertexColors = true;
+      matOpts.color = 0xffffff;
+    } else {
+      matOpts.color = 0x9fe6ff;
+    }
+
+    this.micGroup.add(new THREE.Points(geo, new THREE.PointsMaterial(matOpts)));
+  }
+
+  // mics, weights, corners are for the primary (active) plane
+  // allResults: { xy, xz, yz } — corners needed to position other planes
+  update(mics, weights, corners, activePlane, allResults, multiplane) {
+    this._activePlane = activePlane || "xy";
+    this._multiplane  = multiplane || false;
+    this._lastMics    = mics;
+    this._lastWeights = weights;
+    this._buildMicPoints();
 
     // ── focus planes ──
     // Always (re)build the active plane; build others from allResults if present
@@ -338,10 +360,10 @@ export class Geometry3D {
       if (!mesh) continue;
       if (p === this._activePlane) {
         mesh.visible = true;
-        mesh.material.opacity = PLANE_OPACITY_ACTIVE;
+        mesh.material.opacity = this._planeFade ? PLANE_OPACITY_ACTIVE : 1.0;
       } else if (this._multiplane) {
         mesh.visible = true;
-        mesh.material.opacity = PLANE_OPACITY_PASSIVE;
+        mesh.material.opacity = this._planeFade ? PLANE_OPACITY_PASSIVE : 1.0;
       } else {
         mesh.visible = false;
       }
@@ -395,26 +417,35 @@ export class Geometry3D {
   }
 
   // ── STL model ─────────────────────────────────────────────────
-  // Load an STL and (optionally) paint the PSF onto its surface. The mesh is
-  // de-indexed into per-vertex positions so every vertex can carry its own
-  // colour; `surfacePoints()` hands those world-space vertices to the engine,
-  // and `setSurfaceLevels()` paints the returned dB values back onto them.
+  // Load an STL, transformed by units-scale, rotation and translation. The
+  // mesh itself stays a neutral grey; "painting the PSF" is done by
+  // `surfacePoints()` sampling an area-weighted uniform point cloud over the
+  // mesh surface (the JS equivalent of open3d's sample_points_uniformly) and
+  // `setSurfaceLevels()` rendering the beamformed levels as a coloured
+  // THREE.Points cloud over the mesh.
 
-  /** Parse STL bytes and add the mesh. `scale` converts model units → metres. */
-  loadSTL(arrayBuffer, scale = 1.0) {
+  /**
+   * Parse STL bytes and add the mesh. `xform` converts model units → metres
+   * (`scale`), then orients (`rotX/Y/Z`, degrees) then positions (`tx/ty/tz`,
+   * metres) — baked directly into world-space vertices, same as the previous
+   * scale-only behaviour, so `surfacePoints()` can keep handing back plain
+   * world-space points.
+   */
+  loadSTL(arrayBuffer, xform = {}) {
+    const { scale = 1, rotX = 0, rotY = 0, rotZ = 0, tx = 0, ty = 0, tz = 0 } = xform;
     const geo = new STLLoader().parse(arrayBuffer);
     this.clearSTL();
 
     geo.scale(scale, scale, scale);
+    if (rotX) geo.rotateX(THREE.MathUtils.degToRad(rotX));
+    if (rotY) geo.rotateY(THREE.MathUtils.degToRad(rotY));
+    if (rotZ) geo.rotateZ(THREE.MathUtils.degToRad(rotZ));
+    if (tx || ty || tz) geo.translate(tx, ty, tz);
     geo.computeVertexNormals();
-    // Ensure non-indexed so each triangle vertex has its own colour slot.
     const g = geo.index ? geo.toNonIndexed() : geo;
 
-    const n = g.getAttribute("position").count;
-    g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3).fill(0.6), 3));
-
     const mat = new THREE.MeshPhysicalMaterial({
-      vertexColors: true,
+      color: 0x999999,
       side: THREE.DoubleSide,
       roughness: 0.55,
       metalness: 0.0,
@@ -425,10 +456,11 @@ export class Geometry3D {
     this.stlMesh.receiveShadow = true;
     this.scene.add(this.stlMesh);
     this._markDirty();
-    return n;
+    return g.getAttribute("position").count;
   }
 
   clearSTL() {
+    this.clearSurfaceLevels();
     if (!this.stlMesh) return;
     this.scene.remove(this.stlMesh);
     this.stlMesh.geometry.dispose();
@@ -443,84 +475,108 @@ export class Geometry3D {
   }
 
   /**
-   * The mesh's world-space vertices, thinned to at most `budget` points, plus the
-   * index map needed to paint the results back. Evaluating the beamformer at every
-   * vertex of a real STL would be far too slow, so we sample a stride and give each
-   * skipped vertex the level of its nearest kept sample.
+   * An area-weighted uniform sample of world-space points over the mesh
+   * surface — `density` points per m² on average, mirroring open3d's
+   * sample_points_uniformly. Each triangle is chosen with probability
+   * proportional to its area, then a uniformly-random point is taken inside
+   * it via barycentric coordinates.
    */
-  surfacePoints(budget = 4000) {
+  surfacePoints(density = 2000, maxPoints = 60000) {
     if (!this.stlMesh) return null;
     const pos = this.stlMesh.geometry.getAttribute("position");
-    const total = pos.count;
-    const stride = Math.max(1, Math.ceil(total / budget));
-    const points = [];
-    // vertex i takes its colour from sample index `Math.floor(i / stride)`
-    for (let i = 0; i < total; i += stride) {
-      points.push([pos.getX(i), pos.getY(i), pos.getZ(i)]);
+    const triCount = pos.count / 3;
+    if (triCount < 1) return { points: [] };
+
+    const areas = new Float64Array(triCount);
+    const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
+    const ab = new THREE.Vector3(), ac = new THREE.Vector3(), cross = new THREE.Vector3();
+    let totalArea = 0;
+    for (let t = 0; t < triCount; t++) {
+      va.fromBufferAttribute(pos, t * 3);
+      vb.fromBufferAttribute(pos, t * 3 + 1);
+      vc.fromBufferAttribute(pos, t * 3 + 2);
+      ab.subVectors(vb, va);
+      ac.subVectors(vc, va);
+      cross.crossVectors(ab, ac);
+      const area = cross.length() * 0.5;
+      areas[t] = area;
+      totalArea += area;
     }
-    return { points, stride, total };
+
+    const n = Math.min(maxPoints, Math.max(0, Math.round(density * totalArea)));
+    const cdf = new Float64Array(triCount);
+    let acc = 0;
+    for (let t = 0; t < triCount; t++) { acc += areas[t]; cdf[t] = acc; }
+
+    const points = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const r = Math.random() * totalArea;
+      // binary search for the first triangle whose cumulative area exceeds r
+      let lo = 0, hi = triCount - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (cdf[mid] < r) lo = mid + 1; else hi = mid;
+      }
+      const t = lo;
+      va.fromBufferAttribute(pos, t * 3);
+      vb.fromBufferAttribute(pos, t * 3 + 1);
+      vc.fromBufferAttribute(pos, t * 3 + 2);
+      let u = Math.random(), v = Math.random();
+      if (u + v > 1) { u = 1 - u; v = 1 - v; }
+      const x = va.x + u * (vb.x - va.x) + v * (vc.x - va.x);
+      const y = va.y + u * (vb.y - va.y) + v * (vc.y - va.y);
+      const z = va.z + u * (vb.z - va.z) + v * (vc.z - va.z);
+      points[i] = [x, y, z];
+    }
+    return { points, totalArea };
   }
 
-  /** Paint dB levels (one per sampled point) onto the mesh's vertex colours. */
-  setSurfaceLevels(values, stride, dynamicDb, colormap) {
-    if (!this.stlMesh) return;
+  /** Render dB levels (one per sampled point) as a coloured point cloud over the mesh. */
+  setSurfaceLevels(points, values, dynamicDb, colormap) {
+    this.clearSurfaceLevels();
+    if (!this.stlMesh || !points.length) return;
     const lut = rgbLut(colormap);
-    const color = this.stlMesh.geometry.getAttribute("color");
-    const total = color.count;
-    for (let i = 0; i < total; i++) {
-      const s = Math.min(values.length - 1, Math.floor(i / stride));
-      const [r, g, b] = lutColor(lut, values[s], dynamicDb);
-      color.setXYZ(i, r, g, b);
+    const kept = [];
+    for (let i = 0; i < points.length; i++) {
+      // Below the dynamic-range floor: excluded entirely, not just dim.
+      if (values[i] < -dynamicDb) continue;
+      kept.push(i);
     }
-    color.needsUpdate = true;
+    const positions = new Float32Array(kept.length * 3);
+    const colors = new Float32Array(kept.length * 3);
+    kept.forEach((i, k) => {
+      const [x, y, z] = points[i];
+      positions[k*3] = x; positions[k*3+1] = y; positions[k*3+2] = z;
+      const [r, g, b] = lutColor(lut, values[i], dynamicDb);
+      colors[k*3] = r; colors[k*3+1] = g; colors[k*3+2] = b;
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    const mat = new THREE.PointsMaterial({
+      size: 0.01,
+      vertexColors: true,
+      transparent: true,
+      depthWrite: false,
+      sizeAttenuation: true,
+      opacity: 0.95,
+    });
+    this.stlPoints = new THREE.Points(geo, mat);
+    this.scene.add(this.stlPoints);
     this._markDirty();
   }
 
-  /** Reset the mesh to a neutral grey (PSF painting switched off). */
+  /** Remove the surface point cloud (PSF painting switched off). */
   clearSurfaceLevels() {
-    if (!this.stlMesh) return;
-    const color = this.stlMesh.geometry.getAttribute("color");
-    for (let i = 0; i < color.count; i++) color.setXYZ(i, 0.6, 0.6, 0.6);
-    color.needsUpdate = true;
+    if (!this.stlPoints) return;
+    this.scene.remove(this.stlPoints);
+    this.stlPoints.geometry.dispose();
+    this.stlPoints.material.dispose();
+    this.stlPoints = null;
     this._markDirty();
   }
 
-  // ── Path tracing ──────────────────────────────────────────────
-  async setRaytrace(enabled) {
-    this._raytrace = enabled;
-    if (enabled) {
-      await this._initPathTracer();
-    } else {
-      this._ptRenderer = null;
-      this._ptReady    = false;
-    }
-    this._markDirty();
-  }
-
-  async _initPathTracer() {
-    const mod = await loadPathTracer();
-    if (!mod) {
-      console.warn("three-gpu-pathtracer not installed. Run: npm install three-gpu-pathtracer");
-      this._raytrace = false;
-      return;
-    }
-    const { WebGLPathTracer } = mod;
-    const r = this.host.getBoundingClientRect();
-    const pt = new WebGLPathTracer(this.renderer);
-    pt.setSize(r.width || 800, r.height || 600);
-    pt.renderScale = 0.5;          // start at half-res for fast first pass
-    pt.tiles.set(2, 2);
-    pt.multipleImportanceSampling = true;
-    pt.bounces = 4;
-    pt.setScene(this.scene, this.camera);
-    this._ptRenderer = pt;
-    this._ptReady    = true;
-  }
-
-  _markDirty() {
-    this._ptDirty = true;
-    if (this._ptRenderer) this._ptRenderer.reset();
-  }
+  _markDirty() {}
 
   _animate() {
     this._raf = requestAnimationFrame(this._animate);
@@ -533,12 +589,7 @@ export class Geometry3D {
       for (const sp of this._extraSprites) if (sp.visible) sp.scale.setScalar(s * 0.85);
     }
 
-    if (this._raytrace && this._ptReady && this._ptRenderer) {
-      // Progressive path tracing — accumulates samples each frame
-      this._ptRenderer.renderSample();
-    } else {
-      this.renderer.render(this.scene, this.camera);
-    }
+    this.renderer.render(this.scene, this.camera);
   }
 }
 

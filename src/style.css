@@ -73,6 +73,17 @@ html, body {
 .stage-psf { grid-area: stagepsf; }
 .metrics { grid-area: metrics; }
 
+/* 2-D / 3-D view toggle: collapse the hidden stage and let the other fill the row */
+.app.hide-3d, .app.hide-psf {
+  grid-template-columns: 322px minmax(0, 1fr);
+  grid-template-areas:
+    "topbar topbar"
+    "rail   stage"
+    "rail   metrics";
+}
+.app.hide-3d .stage-3d, .app.hide-psf .stage-psf { display: none; }
+.app.hide-3d .stage-psf, .app.hide-psf .stage-3d { grid-area: stage; }
+
 /* glass surface shared by panels */
 .rail, .stage, .metrics, .topbar {
   background: var(--panel);
@@ -168,6 +179,22 @@ html, body {
   color: var(--accent);
   margin-bottom: 13px;
   opacity: 0.85;
+  cursor: pointer;
+  list-style: none;
+  display: flex; align-items: center; justify-content: space-between;
+  user-select: none;
+}
+.eyebrow::-webkit-details-marker { display: none; }
+.eyebrow::after {
+  content: "▾";
+  font-size: 9px;
+  transition: transform 0.15s ease;
+}
+details:not([open]) > .eyebrow {
+  margin-bottom: 0;
+}
+details:not([open]) > .eyebrow::after {
+  transform: rotate(-90deg);
 }
 
 .field { display: block; margin: 12px 0; }
@@ -286,6 +313,10 @@ input[type="number"]:focus, .file-btn:focus-visible {
 .check { display: flex; align-items: center; gap: 9px; margin-top: 12px; cursor: pointer; font-size: 12px; color: var(--ink-dim); }
 .check input { accent-color: var(--accent); width: 15px; height: 15px; }
 
+progress { accent-color: var(--accent); height: 6px; border-radius: 3px; border: none; }
+progress::-webkit-progress-bar { background: var(--stroke); border-radius: 3px; }
+progress::-webkit-progress-value { background: var(--accent); border-radius: 3px; }
+
 /* ───────────────────────────── stages ───────────────────────────── */
 
 .stage {
@@ -298,17 +329,6 @@ input[type="number"]:focus, .file-btn:focus-visible {
   box-shadow: 0 16px 40px -24px rgba(0, 0, 0, 0.8), inset 0 1px 0 0 var(--panel-hi);
   overflow: hidden;
 }
-.rt-badge {
-  color: var(--accent);
-  font-size: 9.5px;
-  letter-spacing: 0.5px;
-  animation: pulse-badge 2s ease-in-out infinite;
-}
-@keyframes pulse-badge {
-  0%, 100% { opacity: 0.7; }
-  50% { opacity: 1; }
-}
-
 .panel-label {
   position: absolute; top: 12px; left: 14px; z-index: 3;
   font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 1px;
