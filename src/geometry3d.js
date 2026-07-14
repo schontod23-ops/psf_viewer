@@ -448,14 +448,11 @@ export class Geometry3D {
     const g = geo.index ? geo.toNonIndexed() : geo;
 
     const n = g.getAttribute("position").count;
-    // RGBA: alpha lets setSurfaceLevels() hide vertices below the dynamic-range floor.
-    const colors = new Float32Array(n * 4);
-    for (let i = 0; i < n; i++) { colors[i*4]=0.6; colors[i*4+1]=0.6; colors[i*4+2]=0.6; colors[i*4+3]=1; }
-    g.setAttribute("color", new THREE.BufferAttribute(colors, 4));
+    const colors = new Float32Array(n * 3).fill(0.6);
+    g.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 
     const mat = new THREE.MeshPhysicalMaterial({
       vertexColors: true,
-      transparent: true,
       side: THREE.DoubleSide,
       roughness: 0.55,
       metalness: 0.0,
@@ -545,8 +542,8 @@ export class Geometry3D {
    * Colour the whole mesh from dB levels evaluated at a sparse sample of
    * surface points: every mesh vertex takes the value of its nearest sample
    * (via a kd-tree over `points`), so the full surface reads as painted
-   * rather than just the evaluated points. Vertices whose nearest sample is
-   * below the dynamic-range floor are made transparent instead of dim.
+   * rather than just the evaluated points. Values below the dynamic-range
+   * floor clamp to the colormap's bottom colour, same as the 2-D/3-D maps.
    */
   setSurfaceLevels(points, values, dynamicDb, colormap) {
     if (!this.stlMesh || !points.length) return;
@@ -557,20 +554,18 @@ export class Geometry3D {
     const total = color.count;
     for (let i = 0; i < total; i++) {
       const s = kdNearest(tree, points, pos.getX(i), pos.getY(i), pos.getZ(i));
-      const v = values[s];
-      const [r, g, b] = lutColor(lut, v, dynamicDb);
-      const a = v < -dynamicDb ? 0 : 1;
-      color.setXYZW(i, r, g, b, a);
+      const [r, g, b] = lutColor(lut, values[s], dynamicDb);
+      color.setXYZ(i, r, g, b);
     }
     color.needsUpdate = true;
     this._markDirty();
   }
 
-  /** Reset the mesh to a neutral opaque grey (PSF painting switched off). */
+  /** Reset the mesh to a neutral grey (PSF painting switched off). */
   clearSurfaceLevels() {
     if (!this.stlMesh) return;
     const color = this.stlMesh.geometry.getAttribute("color");
-    for (let i = 0; i < color.count; i++) color.setXYZW(i, 0.6, 0.6, 0.6, 1);
+    for (let i = 0; i < color.count; i++) color.setXYZ(i, 0.6, 0.6, 0.6);
     color.needsUpdate = true;
     this._markDirty();
   }
